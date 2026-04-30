@@ -1786,71 +1786,106 @@ def _mb_request(url: str) -> dict:
         return json.loads(r.read())
 
 def _caa_artwork(release_mbid: str) -> str:
-    """Resolve CoverArtArchive front image URL for a release MBID."""
+    """Follow CoverArtArchive /front redirect to get the final HTTPS image URL."""
     try:
-        data = _mb_request(f"https://coverartarchive.org/release/{release_mbid}")
-        for img in data.get("images", []):
-            if img.get("front"):
-                return img.get("image", "")
-        # fallback: first image
-        images = data.get("images", [])
-        return images[0].get("image", "") if images else ""
+        req = urllib.request.Request(
+            f"https://coverartarchive.org/release/{release_mbid}/front",
+            headers={"User-Agent": _MB_UA},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.url  # final HTTPS CDN URL after redirect
     except Exception:
         return ""
+
+def _artist_matches(query_artist: str, result_artist: str) -> bool:
+    """Check that result artist shares at least one meaningful word with the query."""
+    if not query_artist:
+        return True
+    q_words = {w for w in query_artist.lower().split() if len(w) > 2}
+    r_lower  = result_artist.lower()
+    return any(w in r_lower for w in q_words)
+
+def _mb_credits(item: dict, fallback: str) -> str:
+    credits = item.get("artist-credit", [])
+    return "".join(
+        (c.get("artist", {}).get("name", "") + c.get("joinphrase", ""))
+        for c in credits if isinstance(c, dict)
+    ).strip() or fallback
 
 def _mb_search(artist: str, title: str, kind: str) -> dict | None:
     """Query MusicBrainz and return normalized metadata dict or None."""
     try:
         if kind == "album":
-            q   = f'release:"{title}"' + (f' AND artist:"{artist}"' if artist else "")
-            url = f"https://musicbrainz.org/ws/2/release?query={urllib.parse.quote(q)}&fmt=json&limit=1"
+            q   = f'release-group:"{title}"' + (f' AND artist:"{artist}"' if artist else "")
+            url = f"https://musicbrainz.org/ws/2/release-group?query={urllib.parse.quote(q)}&fmt=json&limit=5"
             data  = _mb_request(url)
-            items = data.get("releases", [])
+            items = data.get("release-groups", [])
             if not items:
                 return None
-            item  = items[0]
-            mbid  = item.get("id", "")
-            credits = item.get("artist-credit", [])
-            artist_name = "".join(
-                (c.get("artist", {}).get("name", "") + c.get("joinphrase", ""))
-                for c in credits if isinstance(c, dict)
-            ).strip() or artist
-            return {
-                "title":       item.get("title", title),
-                "artist":      artist_name,
-                "album":       item.get("title", ""),
-                "year":        (item.get("date") or "")[:4],
-                "genre":       "",
-                "artwork_url": "",
-                "mbid":        mbid,
-            }
+            # Pick first result whose artist matches query
+            for item in items:
+                artist_name = _mb_credits(item, artist)
+                if artist and not _artist_matches(artist, artist_name):
+                    continue
+                # Fetch a release MBID for cover art
+                releases = item.get("releases", [])
+                mbid     = releases[0].get("id", "") if releases else ""
+                year     = (item.get("first-release-date") or "")[:4]
+                tags     = item.get("tags", [])
+                genre    = tags[0]["name"].title() if tags else ""
+                return {
+                    "title":       item.get("title", title),
+                    "artist":      artist_name,
+                    "album":       item.get("title", ""),
+                    "year":        year,
+                    "genre":       genre,
+                    "artwork_url": "",
+                    "mbid":        mbid,
+                }
+            return None
         else:
             q   = f'recording:"{title}"' + (f' AND artist:"{artist}"' if artist else "")
-            url = f"https://musicbrainz.org/ws/2/recording?query={urllib.parse.quote(q)}&fmt=json&limit=1"
+            url = f"https://musicbrainz.org/ws/2/recording?query={urllib.parse.quote(q)}&fmt=json&limit=5"
             data  = _mb_request(url)
             items = data.get("recordings", [])
             if not items:
                 return None
-            item  = items[0]
-            credits = item.get("artist-credit", [])
-            artist_name = "".join(
-                (c.get("artist", {}).get("name", "") + c.get("joinphrase", ""))
-                for c in credits if isinstance(c, dict)
-            ).strip() or artist
-            releases = item.get("releases", [])
-            release  = releases[0] if releases else {}
-            mbid     = release.get("id", "")
-            tags     = item.get("tags", [])
-            genre    = tags[0]["name"].title() if tags else ""
-            return {
-                "title":       item.get("title", title),
-                "artist":      artist_name,
-                "album":       release.get("title", ""),
-                "year":        (release.get("date") or "")[:4],
-                "genre":       genre,
-                "artwork_url": "",
-                "mbid":        mbid,
-            }
+            for item in items:
+                artist_name = _mb_credits(item, artist)
+                if artist and not _artist_matches(artist, artist_name):
+                    continue
+                releases = item.get("releases", [])
+                # Prefer proper Album releases (not compilations/live) with a date
+                def _rel_score(r):
+                    rg = r.get("release-group", {})
+                    pt = rg.get("primary-type", "")
+                    st = rg.get("secondary-types") or []
+                    if pt == "Album" and "Compilation" not in st and "Live" not in st:
+                        return 0
+                    if pt == "Single":
+                        return 1
+                    if pt == "Album":
+                        return 2
+                    return 3
+                dated = sorted([r for r in releases if r.get("date")], key=_rel_score)
+                release = dated[0] if dated else (releases[0] if releases else {})
+                mbid    = release.get("id", "")
+                year    = (release.get("date") or "")[:4]
+                # Fallback year from release-group
+                if not year and release.get("release-group"):
+                    year = (release["release-group"].get("first-release-date") or "")[:4]
+                tags  = item.get("tags", [])
+                genre = tags[0]["name"].title() if tags else ""
+                return {
+                    "title":       item.get("title", title),
+                    "artist":      artist_name,
+                    "album":       release.get("title", ""),
+                    "year":        year,
+                    "genre":       genre,
+                    "artwork_url": "",
+                    "mbid":        mbid,
+                }
+            return None
     except Exception as e:
         log.warning("MusicBrainz search failed (%r): %s", title, e)
         return None
@@ -1906,11 +1941,18 @@ def _fetch_meta(artist: str, title: str, kind: str) -> dict:
     """MusicBrainz-first metadata fetch with iTunes fallback (mirrors beets pipeline)."""
     clean = _strip_featured(artist)
 
-    # Try MusicBrainz with progressively simpler queries
+    # Build deduplicated candidate list; title-only last and only when artist is set
+    seen, candidates = set(), []
+    for a, t in [(clean, title), (artist, title)]:
+        key = (a.lower(), t.lower())
+        if t and key not in seen:
+            seen.add(key); candidates.append((a, t))
+    # Title-only only when no artist provided — too noisy otherwise (wrong artist matches)
+    if not artist and title and ("", title.lower()) not in seen:
+        candidates.append(("", title))
+
     mb = None
-    for a, t in [(clean, title), (artist, title), ("", title)]:
-        if not t:
-            continue
+    for a, t in candidates:
         log.info("MusicBrainz query: artist=%r title=%r kind=%s", a, t, kind)
         mb = _mb_search(a, t, kind)
         if mb:
