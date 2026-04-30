@@ -1774,35 +1774,50 @@ def _inline(rows):
     """Build an inline keyboard JSON string from a list of button rows."""
     return json.dumps({"inline_keyboard": rows})
 
+def _strip_featured(artist: str) -> str:
+    """Remove 'ft ...', 'feat ...', '& ...' collab suffixes from artist string."""
+    return re.split(r'\s+(?:ft\.?|feat\.?|x\b)', artist, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
 def _itunes_meta(artist: str, title: str, kind: str) -> dict:
-    """Fetch iTunes metadata (title, artist, album, artwork_url, year)."""
-    entity = "album" if kind == "album" else "song"
-    raw_q  = f"{artist} {title}".strip()
-    q      = urllib.parse.quote(raw_q)
-    url    = f"https://itunes.apple.com/search?term={q}&entity={entity}&limit=1"
-    log.info("iTunes query: %r (entity=%s)", raw_q, entity)
-    try:
-        with urllib.request.urlopen(url, timeout=8) as r:
-            data = json.loads(r.read())
-        results = data.get("results", [])
-        if not results:
-            log.info("iTunes: no results for %r", raw_q)
-            return {}
-        item    = results[0]
-        artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-        meta    = {
-            "title":       item.get("trackName") or item.get("collectionName", title),
-            "artist":      item.get("artistName", artist),
-            "album":       item.get("collectionName", ""),
-            "year":        str(item.get("releaseDate", ""))[:4],
-            "artwork_url": artwork,
-            "genre":       item.get("primaryGenreName", ""),
-        }
-        log.info("iTunes hit: %r — artwork=%s", meta.get("title"), bool(artwork))
-        return meta
-    except Exception as e:
-        log.warning("iTunes fetch failed: %s", e)
-        return {}
+    """Fetch iTunes metadata with progressive query fallback."""
+    entity       = "album" if kind == "album" else "song"
+    clean_artist = _strip_featured(artist)
+
+    # Try queries from most specific to least — stop on first hit
+    candidates = []
+    if clean_artist and title:
+        candidates.append(f"{clean_artist} {title}")
+    if artist != clean_artist and title:
+        candidates.append(f"{artist} {title}")  # original with collabs as last resort
+    if title:
+        candidates.append(title)               # title-only fallback
+
+    for raw_q in candidates:
+        q   = urllib.parse.quote(raw_q)
+        url = f"https://itunes.apple.com/search?term={q}&entity={entity}&limit=1"
+        log.info("iTunes query: %r (entity=%s)", raw_q, entity)
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                data = json.loads(r.read())
+            item = (data.get("results") or [None])[0]
+            if not item:
+                log.info("iTunes: no results for %r", raw_q)
+                continue
+            artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+            meta    = {
+                "title":       item.get("trackName") or item.get("collectionName", title),
+                "artist":      item.get("artistName", artist),
+                "album":       item.get("collectionName", ""),
+                "year":        str(item.get("releaseDate", ""))[:4],
+                "artwork_url": artwork,
+                "genre":       item.get("primaryGenreName", ""),
+            }
+            log.info("iTunes hit on %r: %r artwork=%s", raw_q, meta.get("title"), bool(artwork))
+            return meta
+        except Exception as e:
+            log.warning("iTunes fetch failed for %r: %s", raw_q, e)
+
+    return {}
 
 def _slskd_search_only(query: str) -> list:
     """Run a slskd search and return ranked folder list (no download)."""
@@ -2011,48 +2026,47 @@ def _result_keyboard(idx: int, total: int, source: str = "slskd") -> str:
     return json.dumps({"inline_keyboard": rows})
 
 def _show_result(chat_id: int, session: dict):
-    idx     = session.get("idx", 0)
-    results = session.get("results", [])
-    text    = _result_text(session, idx)
-    total   = len(results)
-    source  = results[idx].get("source", "slskd") if results else "slskd"
-    kb      = _result_keyboard(idx, total, source)
-    meta    = session.get("meta", {})
-    msg_id  = session.get("result_msg_id")
+    idx      = session.get("idx", 0)
+    results  = session.get("results", [])
+    text     = _result_text(session, idx)
+    total    = len(results)
+    source   = results[idx].get("source", "slskd") if results else "slskd"
+    kb       = _result_keyboard(idx, total, source)
+    meta     = session.get("meta", {})
+    msg_id   = session.get("result_msg_id")
+    msg_type = session.get("result_msg_type", "text")  # "photo" or "text"
+    artwork  = meta.get("artwork_url", "")
 
-    # Send photo if we have artwork and no message yet
-    if meta.get("artwork_url") and not msg_id:
-        log.info("Sending artwork: %s", meta["artwork_url"])
-        r = _tg_call("sendPhoto", chat_id=chat_id,
-                     photo=meta["artwork_url"], caption=text,
-                     parse_mode="Markdown", reply_markup=kb)
-        new_id = r.get("result", {}).get("message_id")
-        if new_id:
-            session["result_msg_id"] = new_id
-            _sess_set(chat_id, session)
-        else:
-            log.warning("sendPhoto failed, falling back to sendMessage")
-            r = tg_send(chat_id, text, reply_markup=kb)
-            new_id = r.get("result", {}).get("message_id")
-            if new_id:
-                session["result_msg_id"] = new_id
-                _sess_set(chat_id, session)
-        return
+    def _save_msg(new_id: int, mtype: str):
+        session["result_msg_id"]   = new_id
+        session["result_msg_type"] = mtype
+        _sess_set(chat_id, session)
 
     if msg_id:
-        if meta.get("artwork_url"):
+        # Edit the existing message using the correct method for its type
+        if msg_type == "photo":
             _tg_call("editMessageCaption", chat_id=chat_id, message_id=msg_id,
                      caption=text, parse_mode="Markdown", reply_markup=kb)
         else:
-            tg_edit(chat_id, msg_id, text)
-            _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
-                     reply_markup=kb)
-    else:
-        r = tg_send(chat_id, text, reply_markup=kb)
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=text, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    # No existing message — send fresh
+    if artwork:
+        log.info("Sending artwork: %s", artwork)
+        r      = _tg_call("sendPhoto", chat_id=chat_id, photo=artwork,
+                          caption=text, parse_mode="Markdown", reply_markup=kb)
         new_id = r.get("result", {}).get("message_id")
         if new_id:
-            session["result_msg_id"] = new_id
-            _sess_set(chat_id, session)
+            _save_msg(new_id, "photo")
+            return
+        log.warning("sendPhoto failed, falling back to sendMessage")
+
+    r      = tg_send(chat_id, text, reply_markup=kb)
+    new_id = r.get("result", {}).get("message_id")
+    if new_id:
+        _save_msg(new_id, "text")
 
 def _progress_text(dl_id: str) -> str:
     with _dl_lock:
@@ -2412,6 +2426,7 @@ def handle_callback(cq: dict):
         if old_msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
         session.pop("result_msg_id", None)
+        session.pop("result_msg_type", None)
         _sess_set(chat_id, session)
         res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{_esc(q)}*…")
         new_id = res.get("result", {}).get("message_id")
@@ -2426,6 +2441,7 @@ def handle_callback(cq: dict):
         if old_msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
         session.pop("result_msg_id", None)
+        session.pop("result_msg_type", None)
         _sess_set(chat_id, session)
         res    = tg_send(chat_id, f"🔍 Searching YouTube for *{_esc(q)}*…")
         new_id = res.get("result", {}).get("message_id")
