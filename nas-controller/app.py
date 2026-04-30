@@ -1599,14 +1599,15 @@ def webhook_deploy():
     return jsonify({"status": "deploying"}), 200
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-def _tg_call(method, **kwargs):
+def _tg_call(method, _timeout=10, **kwargs):
     url  = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(kwargs).encode()
     try:
-        with urllib.request.urlopen(url, data, timeout=10) as r:
+        with urllib.request.urlopen(url, data, timeout=_timeout) as r:
             return json.loads(r.read())
     except Exception as e:
-        log.warning("Telegram %s: %s", method, e); return {}
+        lvl = log.debug if "timed out" in str(e).lower() else log.warning
+        lvl("Telegram %s: %s", method, e); return {}
 
 def _notify_tg(text, force=False):
     global _last_notify_time
@@ -2355,7 +2356,7 @@ def telegram_loop():
     offset = 0
     while True:
         try:
-            res = _tg_call("getUpdates", offset=offset, timeout=30)
+            res = _tg_call("getUpdates", _timeout=35, offset=offset, timeout=30)
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
 
