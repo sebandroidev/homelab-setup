@@ -1,0 +1,15 @@
+services:
+  beets:
+    image: lscr.io/linuxserver/beets:latest
+    container_name: beets
+    restart: unless-stopped
+    ports:
+      - "8337:8337"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/London
+    volumes:
+      - /DATA/AppData/beets/config:/config
+      - /media/sdb/Musics:/music
+      - /media/sdb/Evyy Musics:/evymusics

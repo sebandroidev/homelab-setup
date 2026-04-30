@@ -1,0 +1,16 @@
+services:
+  explo:
+    image: ghcr.io/lumepart/explo:latest
+    restart: unless-stopped
+    container_name: explo
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - /DATA/AppData/explo/.env:/opt/explo/.env
+      - /media/sdb/Musics/Explo:/data/
+    environment:
+      - TZ=Europe/London
+      - WEEKLY_EXPLORATION_SCHEDULE=0 6 * * 1
+      - WEEKLY_EXPLORATION_FLAGS=-p weekly-exploration
+      - DAILY_JAMS_SCHEDULE=0 7 * * *
+      - DAILY_JAMS_FLAGS=-p daily-jams

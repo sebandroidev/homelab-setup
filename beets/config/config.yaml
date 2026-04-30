@@ -1,0 +1,63 @@
+directory: /music
+library: /config/musiclibrary.db
+
+import:
+  write: yes
+  copy: no
+  move: no
+  link: no
+  incremental: yes
+  resume: yes
+  quiet: yes
+  quiet_fallback: asis
+  log: /config/import.log
+  autotag: yes
+
+plugins:
+  - fetchart
+  - embedart
+  - lastgenre
+  - mbsync
+  - missing
+  - duplicates
+  - web
+  - scrub
+
+fetchart:
+  auto: yes
+  maxwidth: 1000
+  sources:
+    - filesystem
+    - coverart
+    - itunes
+    - amazon
+    - albumart
+    - wikipedia
+
+embedart:
+  auto: yes
+  maxwidth: 1000
+
+lastgenre:
+  auto: yes
+  count: 3
+  separator: ", "
+  source: album
+  fallback: artist
+
+scrub:
+  auto: yes
+
+web:
+  host: 0.0.0.0
+  port: 8337
+  readonly: no
+
+paths:
+  default: $albumartist/$year - $album/$track - $title
+  singleton: Non-Album/$artist/$title
+  comp: Compilations/$year - $album/$track - $artist - $title
+
+match:
+  strong_rec_thresh: 0.10
+  medium_rec_thresh: 0.25

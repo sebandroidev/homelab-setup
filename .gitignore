@@ -1,0 +1,20 @@
+# Secrets
+**/.env
+
+# Runtime data
+**/data/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.log
+**/logs/
+**/seen_files.json
+**/history.json
+**/discover.json
+**/spotify.json
+**/app.py.bak
+**/musiclibrary.db
+**/state.pickle
+**/import*.log
+**/lrc-run.log
+**/cron.log

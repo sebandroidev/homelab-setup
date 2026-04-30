@@ -1,0 +1,27 @@
+services:
+  nas-controller:
+    build: .
+    image: nas-controller:latest
+    container_name: nas-controller
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_IDS=${TELEGRAM_CHAT_IDS:-}
+      - LASTFM_API_KEY=${LASTFM_API_KEY:-}
+      - DEPLOY_SECRET=${DEPLOY_SECRET:-}
+      - NAVIDROME_URL=http://host.docker.internal:4533
+      - NAVIDROME_USER=${NAVIDROME_USER:-sebastien}
+      - NAVIDROME_PASS=${NAVIDROME_PASS:-}
+      - DOWNLOADS_DIR=/media/sdb/Musics/Soulseek
+      - SLSKD_URL=http://host.docker.internal:5030
+      - SLSKD_API_KEY=${SLSKD_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /media/sdb:/media/sdb
+      - /DATA/AppData/beets:/DATA/AppData/beets
+      - /DATA/homelab-setup:/DATA/homelab-setup
+      - ./data:/data
