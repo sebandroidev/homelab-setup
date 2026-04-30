@@ -2,7 +2,7 @@
 set -e
 REPO=/DATA/homelab-setup
 cd "$REPO"
-git pull origin main
+GIT_SSH_COMMAND="ssh -i /DATA/.ssh/github_ed25519 -o StrictHostKeyChecking=no" git pull origin main
 
 echo "[deploy] Syncing nas-controller..."
 cp nas-controller/app.py          /DATA/AppData/nas-controller/app.py
