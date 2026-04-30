@@ -10,9 +10,10 @@ cp nas-controller/Dockerfile      /DATA/AppData/nas-controller/Dockerfile
 cp nas-controller/docker-compose.yaml /DATA/AppData/nas-controller/docker-compose.yaml
 
 echo "[deploy] Syncing beets scripts..."
-for f in all-lyrics.py beet-organize.py flac-lyrics.py flac-lrc-simple.py flac-lrc-v3.py beets-cron.sh; do
+for f in all-lyrics.py beet-organize.py beets-cron.sh; do
   [ -f "beets/$f" ] && cp "beets/$f" "/DATA/AppData/beets/$f"
 done
+cp beets/beet-organize.py /DATA/AppData/beets/config/beet-organize.py
 cp beets/config/config.yaml /DATA/AppData/beets/config/config.yaml
 
 echo "[deploy] Restarting containers..."
