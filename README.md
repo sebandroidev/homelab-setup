@@ -26,3 +26,4 @@ Push to `main` → GitHub webhook → `nas-controller` pulls repo and restarts c
 ## Secrets
 
 Never commit `.env` files. Copy `.env.example` → `.env` for each service and fill in values.
+
