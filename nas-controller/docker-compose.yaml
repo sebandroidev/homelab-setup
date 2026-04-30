@@ -23,6 +23,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /media/sdb:/media/sdb
       - /DATA/AppData/beets:/DATA/AppData/beets
+      - /DATA/AppData/nas-controller:/DATA/AppData/nas-controller
       - /DATA/homelab-setup:/DATA/homelab-setup
       - /DATA/.ssh:/DATA/.ssh:ro
       - ./data:/data
