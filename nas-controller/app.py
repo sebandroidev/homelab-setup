@@ -42,7 +42,7 @@ JOBS = {
             "docker exec beets beet import /music -q ; "
             "docker exec beets beet import /evymusics -q ; "
             "docker exec beets beet fetchart ; "
-            "echo y | docker exec -i beets beet embedart"
+            "docker exec beets beet embedart -y"
         ),
     },
     "lyrics": {
@@ -370,7 +370,7 @@ def _run_watch_pipeline(dir_path, files):
         if is_last:
             # fetchart + embedart run on whole library — do once after all imports
             subprocess.run(
-                'docker exec beets beet fetchart ; echo y | docker exec -i beets beet embedart',
+                'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
                 shell=True, capture_output=True, text=True, timeout=1800)
             # Refresh ALL dirs: fetchart/embedart modify files across the whole library
             _refresh_all_watch_dirs()

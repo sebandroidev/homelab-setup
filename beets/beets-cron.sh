@@ -7,6 +7,6 @@ echo "=== [$(date)] beets-cron start ==="
 docker exec beets beet import /music -q
 docker exec beets beet import /evymusics -q
 docker exec beets beet fetchart
-echo y | docker exec -i beets beet embedart
+docker exec beets beet embedart -y
 python3 /DATA/AppData/beets/all-lyrics.py
 echo "=== [$(date)] beets-cron done ==="
