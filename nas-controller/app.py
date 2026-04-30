@@ -83,13 +83,7 @@ EXPOSED_SERVICES = [
 
 # ── Telegram keyboard ────────────────────────────────────────────────────────
 TG_KEYBOARD = json.dumps({
-    "keyboard": [
-        [{"text": "🎵 Load Library"},   {"text": "♻️ Refresh Discover"}],
-        [{"text": "🎵 Run Beets"},       {"text": "📝 Run Lyrics"}],
-        [{"text": "🔧 Run Lrclib"},      {"text": "🔍 Run Explo"}],
-        [{"text": "🌐 Services"},        {"text": "💾 Backup"}],
-        [{"text": "🔎 Search"},           {"text": "🔇 Mute"},    {"text": "🔔 Unmute"}],
-    ],
+    "keyboard": [],
     "resize_keyboard": True,
     "persistent": True,
 })
@@ -126,21 +120,19 @@ _notify_state_lock   = threading.Lock()
 # Free-search state: chat_ids waiting for a search query message
 _search_pending: set = set()
 
-# Spotify
+# Spotify / download
 _spotify: dict = {
     "tracks": [], "playlists": [], "last_import": None, "nav_loaded": None,
 }
-_nav_index: set = set()   # (norm_artist, norm_title)
-_nav_isrc:  set = set()   # ISRC strings
-_downloads: dict = {}     # dl_id -> {track, status, output, started, finished}
-_tg_session: dict = {}    # chat_id -> {missing: [], page: int}
+_nav_index: set = set()
+_nav_isrc:  set = set()
+_downloads: dict = {}
 _sp_lock = threading.Lock()
 _dl_lock = threading.Lock()
 
 # Discover
 _discover: dict = {"artists": [], "last_refresh": None, "refreshing": False}
 _disc_lock = threading.Lock()
-_tg_disc_session: dict = {}  # chat_id -> {artists: [], page: int}
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 def _load_history():
@@ -1738,80 +1730,6 @@ def run_backup_with_tg_progress(chat_id):
     if msg_id: tg_edit(chat_id, msg_id, final)
     else:       tg_send(chat_id, final)
 
-def _tg_spotify_list(chat_id, playlist=""):
-    with _sp_lock:
-        loaded = bool(_spotify["tracks"])
-    if not loaded:
-        tg_send(chat_id, "❌ No Spotify CSV loaded. Upload one via the web UI at port 8888 or send me the CSV file."); return
-    if not _nav_index:
-        tg_send(chat_id, "❌ Navidrome library not indexed. Use /load\\_navidrome first."); return
-    missing = find_missing(playlist)
-    _tg_session[chat_id] = {"missing": missing, "page": 0, "playlist": playlist}
-    _render_tg_page(chat_id)
-
-def _render_tg_page(chat_id):
-    sess = _tg_session.get(chat_id)
-    if not sess: tg_send(chat_id, "No active session. Use /missing first."); return
-    missing = sess["missing"]
-    page    = sess["page"]
-    per_page = 20
-    start   = page * per_page
-    chunk   = missing[start:start + per_page]
-    total   = len(missing)
-    pages   = (total + per_page - 1) // per_page
-
-    if not chunk:
-        tg_send(chat_id, "✅ No missing tracks!"); return
-
-    playlist_label = f" — {sess['playlist']}" if sess["playlist"] else ""
-    lines = [f"*Missing tracks{playlist_label}* ({total} total) — page {page+1}/{pages}\n"]
-    for i, t in enumerate(chunk):
-        num = start + i + 1
-        lines.append(f"`{num}.` {t['artist']} — {t['name']}")
-    lines += ["", f"Type a number (1–{total}) to download, /dl\\_next, /dl\\_prev"]
-    tg_send(chat_id, "\n".join(lines))
-
-def _render_tg_disc(chat_id):
-    sess = _tg_disc_session.get(chat_id)
-    if not sess: tg_send(chat_id, "Use /discover first."); return
-    artists = sess["artists"]
-    page    = sess["page"]
-    per_page = 10
-    start   = page * per_page
-    chunk   = artists[start:start + per_page]
-    total   = len(artists)
-    pages   = (total + per_page - 1) // per_page
-
-    lines = [f"*🔭 Discover* — page {page+1}/{pages}\n"]
-    for i, a in enumerate(chunk):
-        num   = start + i + 1
-        album = a.get("top_album", "?")
-        because = ", ".join(a.get("similar_to", [])[:2])
-        lines.append(f"`{num}.` *{a['artist']}* — {album}\n   ↳ similar to {because}")
-    lines += ["", "Type a number to download top album\n/disc\\_next /disc\\_prev"]
-    tg_send(chat_id, "\n".join(lines))
-
-def handle_tg_csv_file(chat_id, doc):
-    file_id = doc["file_id"]
-    res = _tg_call("getFile", file_id=file_id)
-    file_path = res.get("result", {}).get("file_path", "")
-    if not file_path: tg_send(chat_id, "❌ Could not access file"); return
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    try:
-        with urllib.request.urlopen(url, timeout=30) as r:
-            content = r.read().decode("utf-8-sig")
-        tracks    = parse_spotify_csv(content)
-        playlists = sorted(set(t["playlist"] for t in tracks))
-        with _sp_lock:
-            _spotify["tracks"]      = tracks
-            _spotify["playlists"]   = playlists
-            _spotify["last_import"] = datetime.now().isoformat(timespec="seconds")
-        tg_send(chat_id,
-            f"✅ Loaded *{len(tracks)}* tracks from Spotify CSV\n"
-            f"Playlists: {', '.join(playlists[:8])}"
-            + ("…" if len(playlists) > 8 else ""))
-    except Exception as e:
-        tg_send(chat_id, f"❌ Error parsing CSV: {e}")
 
 def _run_search_download(chat_id: int, query: str):
     """Parse a free-text query and kick off a slskd download, with live status."""
@@ -1836,244 +1754,7 @@ def _run_search_download(chat_id: int, query: str):
 
 
 def handle_tg(chat_id, text):
-    global _mute_until
-    parts = text.strip().split()
-    first = parts[0].lower().lstrip("/").split("@")[0] if parts else ""
-    # If first token is a pure emoji (non-ASCII), use last word as the command
-    cmd = parts[-1].lower().lstrip("/").split("@")[0] if (first and not first.isascii()) else first
-    args = parts[1:] if first.startswith("/") else []
-
-    # Free-search mode: previous message asked for a query — treat this message as the query
-    if chat_id in _search_pending and not text.startswith("/"):
-        _search_pending.discard(chat_id)
-        _run_search_download(chat_id, text.strip())
-        return
-
-    if cmd in ("start", "help"):
-        tg_send(chat_id, (
-            "*NAS Controller*\n\n"
-            "*Jobs:*\n"
-            + "\n".join(f"/run\\_{jid} — {j['icon']} {j['name']}" for jid, j in JOBS.items()) +
-            "\n\n*Watcher:*\n"
-            "/watcher — status\n/pause\\_watcher — pause\n/resume\\_watcher — resume\n"
-            "/refresh\\_index — re-index all audio files\n\n"
-            "*Search & Download:*\n"
-            "/search [query] — search slskd and download\n"
-            "  `Artist - Track` · `Artist - Album` · free text\n\n"
-            "*Notifications:*\n"
-            "/mute [minutes] — silence bot (default 30 min)\n/unmute — re-enable\n\n"
-            "*Spotify Import:*\n"
-            "Send a .csv file — upload Spotify library\n"
-            "/load\\_navidrome — index Navidrome library\n"
-            "/missing [playlist] — list missing tracks (20/page)\n"
-            "/dl\\_next, /dl\\_prev — paginate\n"
-            "`<number>` — download that track\n\n"
-            "*Discover:*\n"
-            "/discover — 🔭 top missing artists from Last.fm\n"
-            "/disc\\_next, /disc\\_prev — paginate\n\n"
-            "*Other:*\n/status — all jobs\n/logs\\_<job> — last output\n/services — 🌐 live service status"
-        ), reply_markup=TG_KEYBOARD); return
-
-    if cmd == "backup":
-        threading.Thread(target=run_backup_with_tg_progress, args=(chat_id,), daemon=True).start(); return
-
-    if cmd.startswith("run_"):
-        job_id = cmd[4:]
-        if job_id not in JOBS: tg_send(chat_id, f"Unknown job `{job_id}`"); return
-        if job_id == "backup":
-            threading.Thread(target=run_backup_with_tg_progress, args=(chat_id,), daemon=True).start(); return
-        threading.Thread(target=run_job_with_tg_stream, args=(job_id, chat_id), daemon=True).start(); return
-
-    if cmd == "services":
-        def _check_services():
-            lines = ["*🌐 Exposed Services*\n"]
-            for svc in EXPOSED_SERVICES:
-                icon = svc["icon"]
-                name = svc["name"]
-                url  = svc["url"]
-                try:
-                    req = urllib.request.Request(svc["check"], method="HEAD")
-                    with urllib.request.urlopen(req, timeout=3) as _:
-                        up = True
-                except urllib.error.HTTPError:
-                    up = True
-                except Exception:
-                    up = False
-                mark = "✅" if up else "❌"
-                lines.append(f"{mark} {icon} [{name}]({url})")
-            tg_send(chat_id, "\n".join(lines))
-        threading.Thread(target=_check_services, daemon=True).start(); return
-
-    if cmd == "status":
-        lines = ["*Job Status*\n"]
-        with _state_lock:
-            for jid, j in JOBS.items():
-                h = _history.get(jid, {})
-                if _locks[jid]: state = "🔄 running"
-                elif h: state = f"{'✅' if h['success'] else '❌'} {h['last_run'][:16].replace('T',' ')} ({h['elapsed']}s)"
-                else: state = "⬜ never run"
-                lines.append(f"{j['icon']} *{j['name']}*: {state}")
-        tg_send(chat_id, "\n".join(lines)); return
-
-    if cmd == "watcher":
-        with _watch_lock:
-            w = dict(_watch)
-        lines = [f"*File Watcher* — {'🟢 Active' if w['enabled'] else '🔴 Paused'}\n"]
-        if w["last_scan"]: lines.append(f"Last scan: {w['last_scan'].replace('T',' ')}")
-        if w["pending"]:
-            lines.append("\n*Pending:*")
-            for d, e in w["pending"].items():
-                lines.append(f"  📁 {_short_dir(d)} ({len(e['files'])} files)")
-        if w["recent"]:
-            lines.append("\n*Recent:*")
-            for r in w["recent"][:5]:
-                lines.append(f"  {'✅' if r['success'] else '⚠️'} {r['dir']} — {r['count']} tracks")
-        tg_send(chat_id, "\n".join(lines)); return
-
-    if cmd == "pause_watcher":
-        with _watch_lock: _watch["enabled"] = False
-        tg_send(chat_id, "⏸ Watcher paused"); return
-
-    if cmd == "resume_watcher":
-        with _watch_lock: _watch["enabled"] = True
-        tg_send(chat_id, "▶️ Watcher resumed"); return
-
-    if cmd == "mute":
-        minutes = int(args[0]) if args else 30
-        with _notify_state_lock:
-            _mute_until = time.time() + minutes * 60
-        tg_send(chat_id, f"🔇 Notifications muted for {minutes} minutes"); return
-
-    if cmd == "unmute":
-        with _notify_state_lock:
-            _mute_until = 0.0
-        tg_send(chat_id, "🔔 Notifications unmuted"); return
-
-    if cmd == "refresh_index":
-        tg_send(chat_id, "🔄 Refreshing file index…")
-        _refresh_all_watch_dirs()
-        tg_send(chat_id, f"✅ Index refreshed — {len(_seen_files)} files indexed"); return
-
-    if cmd == "search":
-        query = " ".join(args).strip()
-        if query:
-            # Inline: /search Artist - Track
-            _run_search_download(chat_id, query)
-        else:
-            # Keyboard button or bare /search — ask for the query
-            _search_pending.add(chat_id)
-            tg_send(chat_id,
-                "🔍 *Search & Download*\n\n"
-                "Send your query:\n"
-                "• `Artist - Track` — single track\n"
-                "• `Artist - Album` — full album\n"
-                "• `Free text` — best match\n\n"
-                "_Next message will be used as the query._")
-        return
-
-    if cmd == "load_navidrome":
-        tg_send(chat_id, "⏳ Indexing Navidrome library…")
-        try:
-            count = load_nav_index()
-            tg_send(chat_id, f"✅ Indexed ~{count} songs from Navidrome")
-        except Exception as e:
-            tg_send(chat_id, f"❌ Error: {e}")
-        return
-
-    if cmd == "discover":
-        with _disc_lock:
-            artists = list(_discover["artists"])
-            refreshing = _discover["refreshing"]
-        if not LASTFM_KEY:
-            tg_send(chat_id, "❌ LASTFM\\_API\\_KEY not configured"); return
-        if refreshing:
-            tg_send(chat_id, "⏳ Refresh in progress, try again soon"); return
-        if not artists:
-            tg_send(chat_id, "No discover data yet. Triggering refresh…")
-            threading.Thread(target=_refresh_discover, daemon=True).start(); return
-        top = artists[:20]
-        _tg_disc_session[chat_id] = {"artists": top, "page": 0}
-        _render_tg_disc(chat_id); return
-
-    if cmd == "disc_next":
-        sess = _tg_disc_session.get(chat_id)
-        if sess and (sess["page"] + 1) * 10 < len(sess["artists"]):
-            sess["page"] += 1
-        _render_tg_disc(chat_id); return
-
-    if cmd == "disc_prev":
-        sess = _tg_disc_session.get(chat_id)
-        if sess and sess["page"] > 0: sess["page"] -= 1
-        _render_tg_disc(chat_id); return
-
-    if cmd == "missing":
-        playlist = " ".join(args)
-        _tg_spotify_list(chat_id, playlist); return
-
-    if cmd == "dl_next":
-        sess = _tg_session.get(chat_id)
-        if sess:
-            per_page = 20
-            total = len(sess["missing"])
-            if (sess["page"] + 1) * per_page < total:
-                sess["page"] += 1
-        _render_tg_page(chat_id); return
-
-    if cmd == "dl_prev":
-        sess = _tg_session.get(chat_id)
-        if sess and sess["page"] > 0: sess["page"] -= 1
-        _render_tg_page(chat_id); return
-
-    if cmd.startswith("logs_"):
-        job_id = cmd[5:]
-        h = _history.get(job_id)
-        if not h: tg_send(chat_id, f"No history for `{job_id}`"); return
-        tg_send(chat_id, f"*Last output — {JOBS[job_id]['name']}*\n```\n{h.get('output','')[-1500:]}\n```"); return
-
-    # Number input → download that track
-    if text.strip().isdigit():
-        num = int(text.strip())
-        # Check discover session first
-        disc_sess = _tg_disc_session.get(chat_id)
-        sp_sess   = _tg_session.get(chat_id)
-        if disc_sess and not sp_sess:
-            artists = disc_sess["artists"]
-            if num < 1 or num > len(artists):
-                tg_send(chat_id, f"Number must be 1–{len(artists)}"); return
-            a = artists[num - 1]
-            if not a.get("top_album"):
-                tg_send(chat_id, "No album data for this artist"); return
-            tg_send(chat_id, f"⬇️ Downloading *{a['artist']}* — *{a['top_album']}*…")
-            track = {"artist": a["artist"], "name": "", "album": a["top_album"]}
-            def _dl_disc(t=track, cid=chat_id):
-                dl_id = start_download(t)
-                while True:
-                    with _dl_lock:
-                        s = _downloads.get(dl_id, {}).get("status", "queued")
-                    if s in ("done", "error"): break
-                    time.sleep(3)
-                icon = "✅" if s == "done" else "❌"
-                tg_send(cid, f"{icon} *{t['artist']}* — *{t['album']}* {'downloaded!' if s=='done' else 'failed'}")
-            threading.Thread(target=_dl_disc, daemon=True).start(); return
-        sess = sp_sess
-        if not sess: tg_send(chat_id, "Use /missing first to get the list."); return
-        missing = sess["missing"]
-        if num < 1 or num > len(missing):
-            tg_send(chat_id, f"Number must be 1–{len(missing)}"); return
-        track = missing[num - 1]
-        tg_send(chat_id, f"⬇️ Downloading *{track['artist']}* — *{track['name']}*…")
-        def _dl_and_notify(t=track, cid=chat_id):
-            dl_id = start_download(t)
-            while True:
-                with _dl_lock:
-                    s = _downloads.get(dl_id, {}).get("status", "queued")
-                if s in ("done", "error"): break
-                time.sleep(3)
-            icon = "✅" if s == "done" else "❌"
-            tg_send(cid, f"{icon} *{t['artist']}* — *{t['name']}* {'downloaded!' if s=='done' else 'download failed'}")
-        threading.Thread(target=_dl_and_notify, daemon=True).start(); return
-
-    tg_send(chat_id, "Unknown command. Try /help")
+    tg_send(chat_id, "🛠 Bot is being rebuilt. Stay tuned.", reply_markup=TG_KEYBOARD)
 
 def telegram_loop():
     if not BOT_TOKEN:
@@ -2089,11 +1770,6 @@ def telegram_loop():
                 chat_id = msg.get("chat", {}).get("id")
                 log.info("TG msg from chat_id=%s", chat_id)
                 if not chat_id or (ALLOWED_IDS and str(chat_id) not in ALLOWED_IDS): continue
-                # Handle CSV file upload
-                doc = msg.get("document", {})
-                if doc and (doc.get("mime_type") in ("text/csv","text/plain","application/octet-stream")
-                            or doc.get("file_name","").endswith(".csv")):
-                    handle_tg_csv_file(chat_id, doc); continue
                 text = (msg.get("text") or "").strip()
                 if text: handle_tg(chat_id, text)
         except Exception as e:
