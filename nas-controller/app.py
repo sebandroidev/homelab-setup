@@ -2017,16 +2017,18 @@ def _fetch_meta(artist: str, title: str, kind: str) -> dict:
 def _slskd_search_only(query: str) -> list:
     """Run a slskd search and return ranked folder list (no download)."""
     res = _slskd("POST", "/api/v0/searches",
-                 {"searchText": query, "responseLimit": 50, "fileLimit": 1000})
+                 {"searchText": query, "responseLimit": 30, "fileLimit": 500})
     if "_error" in res:
         return []
     search_id = res.get("id")
     if not search_id:
         return []
-    for _ in range(45):
+    for tick in range(25):
         time.sleep(1)
         info = _slskd("GET", f"/api/v0/searches/{search_id}")
-        if "Completed" in info.get("state", "") or info.get("isComplete"):
+        completed = "Completed" in info.get("state", "") or info.get("isComplete")
+        enough    = info.get("responseCount", 0) >= 5
+        if completed or (enough and tick >= 4):  # at least 4s + 5 peers
             break
     resp    = _slskd("GET", f"/api/v0/searches/{search_id}/responses")
     results = resp if isinstance(resp, list) else resp.get("responses", [])
@@ -2491,17 +2493,22 @@ def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
     artist= session.get("artist", "")
     q     = f"{artist} {query}".strip() if artist else query
 
+    # Fetch metadata in parallel with the slskd search
+    meta_box = [{}]
+    def _meta_worker():
+        meta_box[0] = _fetch_meta(artist, query, kind)
+    meta_thread = threading.Thread(target=_meta_worker, daemon=True)
+    meta_thread.start()
+
     folders = _slskd_search_only(q)
 
+    # Wait for metadata (should already be done; cap at 5s extra)
+    meta_thread.join(timeout=5)
+    meta = meta_box[0]
+
     if not folders:
-        # No results
         session["step"] = "no_results"
         _sess_set(chat_id, session)
-        kb = _inline([[
-            {"text": "🔁 Retry",              "callback_data": "dl:retry_slskd"},
-            {"text": "▶️ Retry with YouTube", "callback_data": "dl:retry_yt"},
-            {"text": "❌ Cancel",             "callback_data": "dl:cancel"},
-        ]])
         _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
                  text=f"😕 No results on Soulseek for *{_esc(q)}*", parse_mode="Markdown",
                  reply_markup=json.dumps({"inline_keyboard": [[
@@ -2512,17 +2519,12 @@ def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
                  ]]}))
         return
 
-    # Attach source tag to each folder
     for f in folders:
         f["source"] = "slskd"
 
-    meta = _fetch_meta(artist, query, kind)
-
-    session.update({"step": "results", "results": folders[:10],
-                    "idx": 0, "meta": meta})
+    session.update({"step": "results", "results": folders[:10], "idx": 0, "meta": meta})
     _sess_set(chat_id, session)
 
-    # Delete the "Searching…" message
     _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
     _show_result(chat_id, session)
 
