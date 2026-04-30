@@ -1777,17 +1777,20 @@ def _inline(rows):
 def _itunes_meta(artist: str, title: str, kind: str) -> dict:
     """Fetch iTunes metadata (title, artist, album, artwork_url, year)."""
     entity = "album" if kind == "album" else "song"
-    q = urllib.parse.quote(f"{artist} {title}")
-    url = f"https://itunes.apple.com/search?term={q}&entity={entity}&limit=1"
+    raw_q  = f"{artist} {title}".strip()
+    q      = urllib.parse.quote(raw_q)
+    url    = f"https://itunes.apple.com/search?term={q}&entity={entity}&limit=1"
+    log.info("iTunes query: %r (entity=%s)", raw_q, entity)
     try:
         with urllib.request.urlopen(url, timeout=8) as r:
             data = json.loads(r.read())
         results = data.get("results", [])
         if not results:
+            log.info("iTunes: no results for %r", raw_q)
             return {}
-        item = results[0]
+        item    = results[0]
         artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-        return {
+        meta    = {
             "title":       item.get("trackName") or item.get("collectionName", title),
             "artist":      item.get("artistName", artist),
             "album":       item.get("collectionName", ""),
@@ -1795,7 +1798,10 @@ def _itunes_meta(artist: str, title: str, kind: str) -> dict:
             "artwork_url": artwork,
             "genre":       item.get("primaryGenreName", ""),
         }
-    except Exception:
+        log.info("iTunes hit: %r — artwork=%s", meta.get("title"), bool(artwork))
+        return meta
+    except Exception as e:
+        log.warning("iTunes fetch failed: %s", e)
         return {}
 
 def _slskd_search_only(query: str) -> list:
@@ -2016,6 +2022,7 @@ def _show_result(chat_id: int, session: dict):
 
     # Send photo if we have artwork and no message yet
     if meta.get("artwork_url") and not msg_id:
+        log.info("Sending artwork: %s", meta["artwork_url"])
         r = _tg_call("sendPhoto", chat_id=chat_id,
                      photo=meta["artwork_url"], caption=text,
                      parse_mode="Markdown", reply_markup=kb)
@@ -2023,6 +2030,13 @@ def _show_result(chat_id: int, session: dict):
         if new_id:
             session["result_msg_id"] = new_id
             _sess_set(chat_id, session)
+        else:
+            log.warning("sendPhoto failed, falling back to sendMessage")
+            r = tg_send(chat_id, text, reply_markup=kb)
+            new_id = r.get("result", {}).get("message_id")
+            if new_id:
+                session["result_msg_id"] = new_id
+                _sess_set(chat_id, session)
         return
 
     if msg_id:
@@ -2393,26 +2407,30 @@ def handle_callback(cq: dict):
 
     # ── Retry Soulseek ────────────────────────────────────────────────────────
     if data == "dl:retry_slskd":
-        msg_id = cq.get("message", {}).get("message_id")
+        old_msg_id = cq.get("message", {}).get("message_id")
         q = (session.get("artist", "") + " " + session.get("query", "")).strip()
-        if msg_id:
-            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                     text=f"🔍 Searching Soulseek for *{q}*…", parse_mode="Markdown",
-                     reply_markup=json.dumps({"inline_keyboard": []}))
+        if old_msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
+        session.pop("result_msg_id", None)
+        _sess_set(chat_id, session)
+        res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{_esc(q)}*…")
+        new_id = res.get("result", {}).get("message_id")
         threading.Thread(target=_do_slskd_search,
-                         args=(chat_id, session, msg_id), daemon=True).start()
+                         args=(chat_id, session, new_id), daemon=True).start()
         return
 
     # ── Retry YouTube ─────────────────────────────────────────────────────────
     if data == "dl:retry_yt":
-        msg_id = cq.get("message", {}).get("message_id")
+        old_msg_id = cq.get("message", {}).get("message_id")
         q = (session.get("artist", "") + " " + session.get("query", "")).strip()
-        if msg_id:
-            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                     text=f"🔍 Searching YouTube for *{q}*…", parse_mode="Markdown",
-                     reply_markup=json.dumps({"inline_keyboard": []}))
+        if old_msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
+        session.pop("result_msg_id", None)
+        _sess_set(chat_id, session)
+        res    = tg_send(chat_id, f"🔍 Searching YouTube for *{_esc(q)}*…")
+        new_id = res.get("result", {}).get("message_id")
         threading.Thread(target=_do_yt_search,
-                         args=(chat_id, session, msg_id), daemon=True).start()
+                         args=(chat_id, session, new_id), daemon=True).start()
         return
 
     # ── Stall → YouTube fallback ─────────────────────────────────────────────
