@@ -1811,31 +1811,86 @@ def _slskd_search_only(query: str) -> list:
     _slskd("DELETE", f"/api/v0/searches/{search_id}")
     return _peer_folders(results)
 
+_YT_JUNK = {"paroles", "parole vidéo", "parole video", "lyric video", "lyric vid",
+             "lyrics video", "lyrics", "karaoke", "instrumental",
+             "slowed", "reverb", "nightcore", "sped up", "speed up"}
+
 def _ytdl_search(query: str) -> list:
-    """Search YouTube Music via yt-dlp, return up to 5 candidates."""
+    """Search YouTube via yt-dlp, return up to 5 candidates, junk filtered first."""
     import subprocess as sp
     cmd = [
         "yt-dlp", "--dump-json", "--flat-playlist", "--no-warnings",
-        "--default-search", "ytsearch5",
-        f"ytsearch5:{query}"
+        f"ytsearch10:{query}"
     ]
     try:
         out = sp.check_output(cmd, timeout=30, stderr=sp.DEVNULL)
         items = [json.loads(line) for line in out.decode().splitlines() if line.strip()]
-        results = []
-        for item in items[:5]:
-            results.append({
-                "video_id": item.get("id", ""),
-                "title":    item.get("title", ""),
-                "channel":  item.get("channel") or item.get("uploader", ""),
-                "duration": item.get("duration_string") or item.get("duration", ""),
-                "url":      item.get("url") or f"https://www.youtube.com/watch?v={item.get('id','')}",
-            })
-        return results
     except Exception:
         return []
 
-def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str):
+    def _is_junk(item):
+        text = (item.get("title","") + " " + (item.get("channel") or item.get("uploader",""))).lower()
+        return any(kw in text for kw in _YT_JUNK)
+
+    def _too_long(item):
+        dur = item.get("duration") or 0
+        return isinstance(dur, (int, float)) and dur > 600  # >10 min = mix/compilation
+
+    clean   = [i for i in items if not _is_junk(i) and not _too_long(i)]
+    junk    = [i for i in items if _is_junk(i) and not _too_long(i)]
+    ordered = clean + junk  # show clean results first, junk at end if nothing else
+
+    results = []
+    for item in ordered[:5]:
+        results.append({
+            "video_id": item.get("id", ""),
+            "title":    item.get("title", ""),
+            "channel":  item.get("channel") or item.get("uploader", ""),
+            "duration": item.get("duration_string") or str(item.get("duration", "")),
+            "url":      item.get("url") or f"https://www.youtube.com/watch?v={item.get('id','')}",
+            "is_junk":  _is_junk(item),
+        })
+    return results
+
+def _host_to_beets_path(host_path: str) -> str:
+    """Convert host filesystem path to path as seen inside the beets container."""
+    for host_prefix, container_prefix in [
+        ("/media/sdb/Musics", "/music"),
+        ("/media/sdb/Evyy Musics", "/evymusics"),
+    ]:
+        if host_path.startswith(host_prefix):
+            return container_prefix + host_path[len(host_prefix):]
+    return host_path
+
+def _inject_tags(flac_path: str, meta: dict):
+    """Overwrite FLAC tags with clean iTunes metadata using the beets container."""
+    artist = meta.get("artist", "")
+    album  = meta.get("album", "")
+    title  = meta.get("title", "")
+    year   = meta.get("year", "")
+    genre  = meta.get("genre", "")
+    if not (artist and album and title):
+        return  # not enough to be worth injecting
+    container_path = _host_to_beets_path(flac_path)
+    script = (
+        f"import mutagen.flac\n"
+        f"f = mutagen.flac.FLAC({container_path!r})\n"
+        f"f['albumartist'] = [{artist!r}]\n"
+        f"f['artist']      = [{artist!r}]\n"
+        f"f['album']       = [{album!r}]\n"
+        f"f['title']       = [{title!r}]\n"
+        f"f['date']        = [{year!r}]\n"
+        f"f['genre']       = [{genre!r}]\n"
+        f"f.save()\n"
+        f"print('Tags injected: {artist} / {album} / {title}')\n"
+    )
+    import subprocess as sp
+    r = sp.run(["docker", "exec", "beets", "python3", "-c", script],
+               capture_output=True, text=True, timeout=30)
+    return r.stdout.strip()
+
+def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
+                          meta: dict = None):
     """Download a YouTube track as FLAC into the Soulseek downloads dir."""
     out_dir = os.path.join(DOWNLOADS_DIR, f"{artist} - {title}")
     os.makedirs(out_dir, exist_ok=True)
@@ -1857,6 +1912,17 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str):
             _dl_log(dl_id, line.rstrip())
         proc.wait()
         ok = proc.returncode == 0
+        if ok and meta and meta.get("album"):
+            # Inject clean iTunes tags so beet-organize can move the file correctly
+            _dl_log(dl_id, "Injecting iTunes metadata…")
+            flac_files = [
+                os.path.join(out_dir, f) for f in os.listdir(out_dir)
+                if f.lower().endswith(".flac")
+            ]
+            for fpath in flac_files:
+                result = _inject_tags(fpath, meta)
+                if result:
+                    _dl_log(dl_id, result)
         with _dl_lock:
             _downloads[dl_id].update({
                 "status": "done" if ok else "error",
@@ -1907,7 +1973,8 @@ def _result_text(session: dict, idx: int) -> str:
                      (f"  •  {flac} FLAC" if flac else ""))
         lines.append("🟢 Soulseek")
     else:
-        lines.append(f"🎬 {r.get('title','')}")
+        junk_warn = "  ⚠️ _lyrics/cover_" if r.get("is_junk") else ""
+        lines.append(f"🎬 {r.get('title','')}{junk_warn}")
         lines.append(f"📺 {r.get('channel','')}" +
                      (f"  •  {r.get('duration','')}" if r.get('duration') else ""))
         lines.append("🔴 YouTube")
@@ -2107,6 +2174,7 @@ def _start_dl(chat_id: int, session: dict):
         threading.Thread(target=_ytdl_download_worker,
                          args=(dl_id, r["video_id"],
                                session.get("artist", ""), label),
+                         kwargs={"meta": meta},
                          daemon=True).start()
     else:
         username    = r["username"]
