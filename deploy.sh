@@ -16,6 +16,9 @@ done
 cp beets/beet-organize.py /DATA/AppData/beets/config/beet-organize.py
 cp beets/config/config.yaml /DATA/AppData/beets/config/config.yaml
 
+echo "[deploy] Syncing navidrome config..."
+cp navidrome/navidrome.toml /DATA/AppData/navidrome/data/navidrome.toml
+
 echo "[deploy] Restarting containers..."
 docker restart nas-controller
 
