@@ -2037,7 +2037,7 @@ def _progress_text(dl_id: str) -> str:
     lines  = d.get("output", [])
     last   = [l for l in lines[-6:] if l.strip()]
     icons  = {"queued": "⏳", "searching": "🔍", "downloading": "⬇️",
-               "done": "✅", "error": "❌", "paused": "⏸"}
+               "done": "✅", "error": "❌", "paused": "⏸", "stalled": "🕐"}
     icon   = icons.get(status, "⏳")
     text   = f"{icon} *Download* — {status}\n"
     if last:
@@ -2063,7 +2063,7 @@ def _progress_keyboard(dl_id: str) -> str:
 
 def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
     """Background thread: edit progress message every 4s until terminal state."""
-    terminal = {"done", "error"}
+    terminal = {"done", "error", "stalled"}
     while True:
         time.sleep(4)
         text = _progress_text(dl_id)
@@ -2075,8 +2075,12 @@ def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
         if status in terminal:
             break
 
-def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list):
+def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
+                            chat_id: int = 0, kind: str = "track"):
     """Queue already-chosen files from slskd and monitor (no search step)."""
+    # Stall timeout: 5 min for a single track, 15 min for an album/folder
+    stall_limit = 300 if kind == "track" else 900
+
     with _dl_lock:
         _downloads[dl_id].update({"status": "downloading",
                                    "started": datetime.now().isoformat(timespec="seconds")})
@@ -2094,6 +2098,7 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list):
     ever_seen        = False
     confirmed_done: set = set()
     confirmed_fail: set = set()
+    queued_since     = time.time()
 
     for _ in range(1800):
         time.sleep(2)
@@ -2122,7 +2127,36 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list):
                     confirmed_done.add(fname)
                 elif "Completed" in s:
                     confirmed_fail.add(fname)
+
+            # Reset stall clock once transfer actually starts moving
+            active = [f for f in states.values()
+                      if f.get("percentComplete", 0) > 0 or "InProgress" in f.get("state","")]
+            if active:
+                queued_since = time.time()  # no longer stalled
+
         elif not ever_seen:
+            # Files not visible yet — check stall timeout
+            if time.time() - queued_since > stall_limit:
+                waited = int(time.time() - queued_since)
+                _dl_log(dl_id, f"Stalled — no transfer started after {waited}s")
+                with _dl_lock:
+                    _downloads[dl_id].update({
+                        "status": "stalled",
+                        "finished": datetime.now().isoformat(timespec="seconds"),
+                    })
+                if chat_id:
+                    label = _downloads[dl_id].get("track", {}).get("name", "")
+                    mins  = stall_limit // 60
+                    kb    = json.dumps({"inline_keyboard": [[
+                        {"text": "▶️ Try YouTube instead", "callback_data": f"dl:stall_yt:{dl_id}"},
+                        {"text": "❌ Cancel",              "callback_data": f"dl:cancel"},
+                    ]]})
+                    tg_send(chat_id,
+                            f"🕐 *Soulseek is not responding*\n"
+                            f"No transfer started after {mins} min.\n"
+                            f"Peer `{username}` may be offline or busy.",
+                            reply_markup=kb)
+                return
             break
 
         cleared = queued_filenames - set(states.keys()) - confirmed_done - confirmed_fail
@@ -2190,6 +2224,7 @@ def _start_dl(chat_id: int, session: dict):
                            if "." + f["filename"].rsplit(".", 1)[-1].lower() in AUDIO_DL_EXTS]
         threading.Thread(target=_slskd_download_chosen,
                          args=(dl_id, username, files_to_dl),
+                         kwargs={"chat_id": chat_id, "kind": kind},
                          daemon=True).start()
 
     if msg_id:
@@ -2362,6 +2397,22 @@ def handle_callback(cq: dict):
                      reply_markup=json.dumps({"inline_keyboard": []}))
         threading.Thread(target=_do_yt_search,
                          args=(chat_id, session, msg_id), daemon=True).start()
+        return
+
+    # ── Stall → YouTube fallback ─────────────────────────────────────────────
+    if len(parts) == 3 and parts[0] == "dl" and parts[1] == "stall_yt":
+        msg_id = cq.get("message", {}).get("message_id")
+        q = (session.get("artist", "") + " " + session.get("query", "")).strip()
+        # Delete the stall notification message
+        if msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        # Send fresh searching message and kick off YouTube search
+        res    = tg_send(chat_id, f"🔍 Searching YouTube for *{q}*…")
+        new_id = res.get("result", {}).get("message_id")
+        session["step"] = "searching"
+        _sess_set(chat_id, session)
+        threading.Thread(target=_do_yt_search,
+                         args=(chat_id, session, new_id), daemon=True).start()
         return
 
     # ── Pause/Resume/Abort/Clear ──────────────────────────────────────────────
