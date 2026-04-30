@@ -2023,7 +2023,7 @@ def _slskd_search_only(query: str) -> list:
     search_id = res.get("id")
     if not search_id:
         return []
-    for tick in range(25):
+    for tick in range(30):
         time.sleep(1)
         info = _slskd("GET", f"/api/v0/searches/{search_id}")
         completed = "Completed" in info.get("state", "") or info.get("isComplete")
