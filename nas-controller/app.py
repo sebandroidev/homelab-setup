@@ -1778,6 +1778,34 @@ def _strip_featured(artist: str) -> str:
     """Remove 'ft ...', 'feat ...', 'x ...' collab suffixes from artist string."""
     return re.split(r'\s+(?:ft\.?|feat\.?|x\b)', artist, maxsplit=1, flags=re.IGNORECASE)[0].strip()
 
+def _title_matches(query: str, result: str) -> bool:
+    """True if result title is close enough to the queried title."""
+    norm = lambda s: re.sub(r"[^\w\s]", " ", s.lower())
+    q, r = norm(query), norm(result)
+    if q.strip() in r or r.strip() in q:
+        return True
+    q_words = {w for w in q.split() if len(w) > 2}
+    r_words = {w for w in r.split() if len(w) > 2}
+    if not q_words or not r_words:
+        return False
+    return len(q_words & r_words) / max(len(q_words), len(r_words)) >= 0.5
+
+def _artist_artwork(artist: str) -> str:
+    """Get any iTunes artwork for the artist (ignores track title)."""
+    clean = _strip_featured(artist)
+    for q in filter(None, [clean, artist]):
+        try:
+            url = f"https://itunes.apple.com/search?term={urllib.parse.quote(q)}&entity=song&limit=1"
+            with urllib.request.urlopen(url, timeout=8) as r:
+                item = (json.loads(r.read()).get("results") or [None])[0]
+            if item:
+                art = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+                if art:
+                    return art
+        except Exception:
+            pass
+    return ""
+
 _MB_UA = "nas-controller/1.0 (homelab-bot)"
 
 def _mb_request(url: str) -> dict:
@@ -1908,59 +1936,63 @@ def _itunes_artwork(artist: str, title: str, kind: str) -> str:
             pass
     return ""
 
-def _itunes_meta(artist: str, title: str, kind: str) -> dict:
-    """iTunes full metadata fallback (used when MusicBrainz finds nothing)."""
-    entity       = "album" if kind == "album" else "song"
-    clean_artist = _strip_featured(artist)
-    for raw_q in [f"{clean_artist} {title}".strip(), f"{artist} {title}".strip(), title]:
+def _itunes_search_strict(artist: str, title: str, kind: str) -> dict | None:
+    """Query iTunes and return metadata ONLY if the returned title matches the query."""
+    entity = "album" if kind == "album" else "song"
+    clean  = _strip_featured(artist)
+    for raw_q in [f"{clean} {title}".strip(), f"{artist} {title}".strip()]:
         if not raw_q:
             continue
         try:
-            q   = urllib.parse.quote(raw_q)
-            url = f"https://itunes.apple.com/search?term={q}&entity={entity}&limit=1"
-            log.info("iTunes query: %r", raw_q)
+            url = f"https://itunes.apple.com/search?term={urllib.parse.quote(raw_q)}&entity={entity}&limit=5"
+            log.info("iTunes strict query: %r", raw_q)
             with urllib.request.urlopen(url, timeout=8) as r:
-                data = json.loads(r.read())
-            item = (data.get("results") or [None])[0]
-            if not item:
-                continue
-            artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-            return {
-                "title":       item.get("trackName") or item.get("collectionName", title),
-                "artist":      item.get("artistName", artist),
-                "album":       item.get("collectionName", ""),
-                "year":        str(item.get("releaseDate", ""))[:4],
-                "artwork_url": artwork,
-                "genre":       item.get("primaryGenreName", ""),
-            }
+                items = json.loads(r.read()).get("results", [])
+            for item in items:
+                returned = item.get("trackName") or item.get("collectionName", "")
+                if not _title_matches(title, returned):
+                    continue
+                artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+                log.info("iTunes strict hit: %r matches %r", returned, title)
+                return {
+                    "title":       returned,
+                    "artist":      item.get("artistName", artist),
+                    "album":       item.get("collectionName", ""),
+                    "year":        str(item.get("releaseDate", ""))[:4],
+                    "artwork_url": artwork,
+                    "genre":       item.get("primaryGenreName", ""),
+                }
         except Exception as e:
-            log.warning("iTunes fetch failed for %r: %s", raw_q, e)
-    return {}
+            log.warning("iTunes strict fetch failed for %r: %s", raw_q, e)
+    return None
 
 def _fetch_meta(artist: str, title: str, kind: str) -> dict:
-    """MusicBrainz-first metadata fetch with iTunes fallback (mirrors beets pipeline)."""
+    """MusicBrainz-first metadata. Never returns metadata for a different track."""
     clean = _strip_featured(artist)
 
-    # Build deduplicated candidate list; title-only last and only when artist is set
+    # Deduplicated MB candidate queries
     seen, candidates = set(), []
     for a, t in [(clean, title), (artist, title)]:
         key = (a.lower(), t.lower())
         if t and key not in seen:
             seen.add(key); candidates.append((a, t))
-    # Title-only only when no artist provided — too noisy otherwise (wrong artist matches)
     if not artist and title and ("", title.lower()) not in seen:
         candidates.append(("", title))
 
     mb = None
     for a, t in candidates:
         log.info("MusicBrainz query: artist=%r title=%r kind=%s", a, t, kind)
-        mb = _mb_search(a, t, kind)
-        if mb:
-            log.info("MusicBrainz hit: %r by %r (mbid=%s)", mb["title"], mb["artist"], mb.get("mbid"))
-            break
+        result = _mb_search(a, t, kind)
+        if not result:
+            continue
+        if not _title_matches(title, result["title"]):
+            log.info("MB title mismatch: searched %r, got %r — skipping", title, result["title"])
+            continue
+        mb = result
+        log.info("MusicBrainz hit: %r by %r (mbid=%s)", mb["title"], mb["artist"], mb.get("mbid"))
+        break
 
     if mb:
-        # Artwork: CoverArtArchive first, iTunes as fallback
         artwork = ""
         if mb.get("mbid"):
             artwork = _caa_artwork(mb["mbid"])
@@ -1971,9 +2003,16 @@ def _fetch_meta(artist: str, title: str, kind: str) -> dict:
         mb["artwork_url"] = artwork
         return mb
 
-    # MusicBrainz found nothing — full iTunes fallback
-    log.info("MusicBrainz no results, falling back to iTunes")
-    return _itunes_meta(artist, title, kind)
+    # MusicBrainz found nothing or title mismatched — try iTunes strictly
+    itunes = _itunes_search_strict(artist, title, kind)
+    if itunes:
+        return itunes
+
+    # Nothing found — return artist artwork only, never wrong track metadata
+    log.info("No exact match found for %r — %r, using artist artwork only", artist, title)
+    artwork = _artist_artwork(artist)
+    return {"title": "", "artist": artist or "", "album": "", "year": "", "genre": "",
+            "artwork_url": artwork}
 
 def _slskd_search_only(query: str) -> list:
     """Run a slskd search and return ranked folder list (no download)."""
@@ -2025,13 +2064,15 @@ def _ytdl_search(query: str) -> list:
 
     results = []
     for item in ordered[:5]:
+        vid_id = item.get("id", "")
         results.append({
-            "video_id": item.get("id", ""),
-            "title":    item.get("title", ""),
-            "channel":  item.get("channel") or item.get("uploader", ""),
-            "duration": item.get("duration_string") or str(item.get("duration", "")),
-            "url":      item.get("url") or f"https://www.youtube.com/watch?v={item.get('id','')}",
-            "is_junk":  _is_junk(item),
+            "video_id":  vid_id,
+            "title":     item.get("title", ""),
+            "channel":   item.get("channel") or item.get("uploader", ""),
+            "duration":  item.get("duration_string") or str(item.get("duration", "")),
+            "url":       item.get("url") or f"https://www.youtube.com/watch?v={vid_id}",
+            "thumbnail": item.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg" if vid_id else ""),
+            "is_junk":   _is_junk(item),
         })
     return results
 
@@ -2191,7 +2232,10 @@ def _show_result(chat_id: int, session: dict):
     meta     = session.get("meta", {})
     msg_id   = session.get("result_msg_id")
     msg_type = session.get("result_msg_type", "text")  # "photo" or "text"
+    # Artwork: meta first, then YouTube thumbnail as fallback for yt results
     artwork  = meta.get("artwork_url", "")
+    if not artwork and source == "yt" and results:
+        artwork = results[idx].get("thumbnail", "")
 
     def _save_msg(new_id: int, mtype: str):
         session["result_msg_id"]   = new_id
