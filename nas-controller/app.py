@@ -1625,6 +1625,12 @@ def _notify_tg(text, force=False):
     for cid in ALLOWED_IDS:
         _tg_call("sendMessage", chat_id=cid, text=text, parse_mode="Markdown")
 
+def _esc(s: str) -> str:
+    """Escape Telegram legacy Markdown special chars in untrusted text."""
+    for ch in ('_', '*', '`', '['):
+        s = s.replace(ch, '\\' + ch)
+    return s
+
 def tg_send(chat_id, text, reply_markup=None):
     kwargs = dict(chat_id=chat_id, text=text, parse_mode="Markdown")
     if reply_markup is not None:
@@ -1953,13 +1959,13 @@ def _result_text(session: dict, idx: int) -> str:
 
     lines = []
     if meta.get("title"):
-        lines.append(f"*{meta['title']}*")
+        lines.append(f"*{_esc(meta['title'])}*")
     if meta.get("artist"):
-        lines.append(f"🎤 {meta['artist']}")
+        lines.append(f"🎤 {_esc(meta['artist'])}")
     if meta.get("album"):
-        lines.append(f"💿 {meta['album']}" + (f" ({meta['year']})" if meta.get('year') else ""))
+        lines.append(f"💿 {_esc(meta['album'])}" + (f" ({meta['year']})" if meta.get('year') else ""))
     if meta.get("genre"):
-        lines.append(f"🎸 {meta['genre']}")
+        lines.append(f"🎸 {_esc(meta['genre'])}")
     lines.append("")
 
     src = r.get("source", "slskd")
@@ -1969,20 +1975,20 @@ def _result_text(session: dict, idx: int) -> str:
         size   = r.get("total_size", 0) // (1024 * 1024)
         folder = r.get("folder", "").rsplit("\\", 1)[-1]
         lines.append(f"📁 `{folder}`")
-        lines.append(f"👤 {r['username']}  •  {nfiles} file(s)  •  {size} MB" +
+        lines.append(f"👤 {_esc(r['username'])}  •  {nfiles} file(s)  •  {size} MB" +
                      (f"  •  {flac} FLAC" if flac else ""))
         lines.append("🟢 Soulseek")
     else:
         junk_warn = "  ⚠️ _lyrics/cover_" if r.get("is_junk") else ""
-        lines.append(f"🎬 {r.get('title','')}{junk_warn}")
-        lines.append(f"📺 {r.get('channel','')}" +
+        lines.append(f"🎬 {_esc(r.get('title',''))}{junk_warn}")
+        lines.append(f"📺 {_esc(r.get('channel',''))}" +
                      (f"  •  {r.get('duration','')}" if r.get('duration') else ""))
         lines.append("🔴 YouTube")
 
     lines.append(f"\n_{idx + 1}/{total}_")
     return "\n".join(lines)
 
-def _result_keyboard(idx: int, total: int) -> str:
+def _result_keyboard(idx: int, total: int, source: str = "slskd") -> str:
     nav_row = []
     if idx > 0:
         nav_row.append({"text": "← Prev",   "callback_data": f"dl:prev"})
@@ -1994,13 +2000,17 @@ def _result_keyboard(idx: int, total: int) -> str:
         {"text": "❌ Cancel",   "callback_data": "dl:cancel"},
     ]
     rows = [nav_row, action_row] if nav_row else [action_row]
+    if source == "slskd":
+        rows.append([{"text": "🔴 Search on YouTube", "callback_data": "dl:retry_yt"}])
     return json.dumps({"inline_keyboard": rows})
 
 def _show_result(chat_id: int, session: dict):
     idx     = session.get("idx", 0)
+    results = session.get("results", [])
     text    = _result_text(session, idx)
-    total   = len(session.get("results", []))
-    kb      = _result_keyboard(idx, total)
+    total   = len(results)
+    source  = results[idx].get("source", "slskd") if results else "slskd"
+    kb      = _result_keyboard(idx, total, source)
     meta    = session.get("meta", {})
     msg_id  = session.get("result_msg_id")
 
@@ -2265,7 +2275,7 @@ def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
             {"text": "❌ Cancel",             "callback_data": "dl:cancel"},
         ]])
         _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                 text=f"😕 No results on Soulseek for *{q}*", parse_mode="Markdown",
+                 text=f"😕 No results on Soulseek for *{_esc(q)}*", parse_mode="Markdown",
                  reply_markup=json.dumps({"inline_keyboard": [[
                      {"text": "🔁 Retry",              "callback_data": "dl:retry_slskd"},
                      {"text": "▶️ Retry with YouTube", "callback_data": "dl:retry_yt"},
@@ -2300,7 +2310,7 @@ def _do_yt_search(chat_id: int, session: dict, msg_id: int):
     if not items:
         kb = json.dumps({"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "dl:cancel"}]]})
         _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                 text=f"😕 No YouTube results for *{q}*",
+                 text=f"😕 No YouTube results for *{_esc(q)}*",
                  parse_mode="Markdown", reply_markup=kb)
         return
 
