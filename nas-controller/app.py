@@ -83,7 +83,7 @@ EXPOSED_SERVICES = [
 
 # ── Telegram keyboard ────────────────────────────────────────────────────────
 TG_KEYBOARD = json.dumps({
-    "keyboard": [],
+    "keyboard": [[{"text": "⬇️ Download Tracks"}]],
     "resize_keyboard": True,
     "persistent": True,
 })
@@ -133,6 +133,10 @@ _dl_lock = threading.Lock()
 # Discover
 _discover: dict = {"artists": [], "last_refresh": None, "refreshing": False}
 _disc_lock = threading.Lock()
+
+# Download sessions (Telegram interactive downloads)
+_dl_sessions: dict = {}
+_sess_lock = threading.Lock()
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 def _load_history():
@@ -1753,8 +1757,596 @@ def _run_search_download(chat_id: int, query: str):
     threading.Thread(target=_worker, daemon=True).start()
 
 
+# ── Download Tracks feature ───────────────────────────────────────────────────
+
+def _inline(rows):
+    """Build an inline keyboard JSON string from a list of button rows."""
+    return json.dumps({"inline_keyboard": rows})
+
+def _itunes_meta(artist: str, title: str, kind: str) -> dict:
+    """Fetch iTunes metadata (title, artist, album, artwork_url, year)."""
+    entity = "album" if kind == "album" else "song"
+    q = urllib.parse.quote(f"{artist} {title}")
+    url = f"https://itunes.apple.com/search?term={q}&entity={entity}&limit=1"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.loads(r.read())
+        results = data.get("results", [])
+        if not results:
+            return {}
+        item = results[0]
+        artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+        return {
+            "title":       item.get("trackName") or item.get("collectionName", title),
+            "artist":      item.get("artistName", artist),
+            "album":       item.get("collectionName", ""),
+            "year":        str(item.get("releaseDate", ""))[:4],
+            "artwork_url": artwork,
+            "genre":       item.get("primaryGenreName", ""),
+        }
+    except Exception:
+        return {}
+
+def _slskd_search_only(query: str) -> list:
+    """Run a slskd search and return ranked folder list (no download)."""
+    res = _slskd("POST", "/api/v0/searches",
+                 {"searchText": query, "responseLimit": 50, "fileLimit": 1000})
+    if "_error" in res:
+        return []
+    search_id = res.get("id")
+    if not search_id:
+        return []
+    for _ in range(45):
+        time.sleep(1)
+        info = _slskd("GET", f"/api/v0/searches/{search_id}")
+        if "Completed" in info.get("state", "") or info.get("isComplete"):
+            break
+    resp    = _slskd("GET", f"/api/v0/searches/{search_id}/responses")
+    results = resp if isinstance(resp, list) else resp.get("responses", [])
+    _slskd("DELETE", f"/api/v0/searches/{search_id}")
+    return _peer_folders(results)
+
+def _ytdl_search(query: str) -> list:
+    """Search YouTube Music via yt-dlp, return up to 5 candidates."""
+    import subprocess as sp
+    cmd = [
+        "yt-dlp", "--dump-json", "--flat-playlist", "--no-warnings",
+        "--default-search", "ytsearch5",
+        f"ytsearch5:{query}"
+    ]
+    try:
+        out = sp.check_output(cmd, timeout=30, stderr=sp.DEVNULL)
+        items = [json.loads(line) for line in out.decode().splitlines() if line.strip()]
+        results = []
+        for item in items[:5]:
+            results.append({
+                "video_id": item.get("id", ""),
+                "title":    item.get("title", ""),
+                "channel":  item.get("channel") or item.get("uploader", ""),
+                "duration": item.get("duration_string") or item.get("duration", ""),
+                "url":      item.get("url") or f"https://www.youtube.com/watch?v={item.get('id','')}",
+            })
+        return results
+    except Exception:
+        return []
+
+def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str):
+    """Download a YouTube track as FLAC into the Soulseek downloads dir."""
+    out_dir = os.path.join(DOWNLOADS_DIR, f"{artist} - {title}")
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [
+        "yt-dlp",
+        "--extract-audio", "--audio-format", "flac", "--audio-quality", "0",
+        "--embed-metadata", "--add-metadata",
+        "--output", os.path.join(out_dir, "%(title)s.%(ext)s"),
+        "--no-warnings",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    with _dl_lock:
+        _downloads[dl_id].update({"status": "downloading",
+                                   "started": datetime.now().isoformat(timespec="seconds")})
+    try:
+        import subprocess as sp
+        proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        for line in proc.stdout:
+            _dl_log(dl_id, line.rstrip())
+        proc.wait()
+        ok = proc.returncode == 0
+        with _dl_lock:
+            _downloads[dl_id].update({
+                "status": "done" if ok else "error",
+                "finished": datetime.now().isoformat(timespec="seconds"),
+            })
+        _dl_log(dl_id, "Done!" if ok else f"yt-dlp exited {proc.returncode}")
+    except Exception as e:
+        _dl_log(dl_id, f"ERROR: {e}")
+        with _dl_lock:
+            _downloads[dl_id].update({"status": "error",
+                                       "finished": datetime.now().isoformat(timespec="seconds")})
+
+def _sess_get(chat_id: int) -> dict:
+    with _sess_lock:
+        return _dl_sessions.setdefault(chat_id, {})
+
+def _sess_set(chat_id: int, data: dict):
+    with _sess_lock:
+        _dl_sessions[chat_id] = data
+
+def _result_text(session: dict, idx: int) -> str:
+    results = session.get("results", [])
+    total   = len(results)
+    if not results or idx >= total:
+        return "No results."
+    r    = results[idx]
+    meta = session.get("meta", {})
+
+    lines = []
+    if meta.get("title"):
+        lines.append(f"*{meta['title']}*")
+    if meta.get("artist"):
+        lines.append(f"🎤 {meta['artist']}")
+    if meta.get("album"):
+        lines.append(f"💿 {meta['album']}" + (f" ({meta['year']})" if meta.get('year') else ""))
+    if meta.get("genre"):
+        lines.append(f"🎸 {meta['genre']}")
+    lines.append("")
+
+    src = r.get("source", "slskd")
+    if src == "slskd":
+        flac   = r.get("flac_count", 0)
+        nfiles = len(r.get("files", []))
+        size   = r.get("total_size", 0) // (1024 * 1024)
+        folder = r.get("folder", "").rsplit("\\", 1)[-1]
+        lines.append(f"📁 `{folder}`")
+        lines.append(f"👤 {r['username']}  •  {nfiles} file(s)  •  {size} MB" +
+                     (f"  •  {flac} FLAC" if flac else ""))
+        lines.append("🟢 Soulseek")
+    else:
+        lines.append(f"🎬 {r.get('title','')}")
+        lines.append(f"📺 {r.get('channel','')}" +
+                     (f"  •  {r.get('duration','')}" if r.get('duration') else ""))
+        lines.append("🔴 YouTube")
+
+    lines.append(f"\n_{idx + 1}/{total}_")
+    return "\n".join(lines)
+
+def _result_keyboard(idx: int, total: int) -> str:
+    nav_row = []
+    if idx > 0:
+        nav_row.append({"text": "← Prev",   "callback_data": f"dl:prev"})
+    nav_row.append(    {"text": f"{idx+1}/{total}", "callback_data": "dl:noop"})
+    if idx < total - 1:
+        nav_row.append({"text": "Next →",   "callback_data": f"dl:next"})
+    action_row = [
+        {"text": "⬇️ Download", "callback_data": "dl:download"},
+        {"text": "❌ Cancel",   "callback_data": "dl:cancel"},
+    ]
+    rows = [nav_row, action_row] if nav_row else [action_row]
+    return json.dumps({"inline_keyboard": rows})
+
+def _show_result(chat_id: int, session: dict):
+    idx     = session.get("idx", 0)
+    text    = _result_text(session, idx)
+    total   = len(session.get("results", []))
+    kb      = _result_keyboard(idx, total)
+    meta    = session.get("meta", {})
+    msg_id  = session.get("result_msg_id")
+
+    # Send photo if we have artwork and no message yet
+    if meta.get("artwork_url") and not msg_id:
+        r = _tg_call("sendPhoto", chat_id=chat_id,
+                     photo=meta["artwork_url"], caption=text,
+                     parse_mode="Markdown", reply_markup=kb)
+        new_id = r.get("result", {}).get("message_id")
+        if new_id:
+            session["result_msg_id"] = new_id
+            _sess_set(chat_id, session)
+        return
+
+    if msg_id:
+        if meta.get("artwork_url"):
+            _tg_call("editMessageCaption", chat_id=chat_id, message_id=msg_id,
+                     caption=text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            tg_edit(chat_id, msg_id, text)
+            _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
+                     reply_markup=kb)
+    else:
+        r = tg_send(chat_id, text, reply_markup=kb)
+        new_id = r.get("result", {}).get("message_id")
+        if new_id:
+            session["result_msg_id"] = new_id
+            _sess_set(chat_id, session)
+
+def _progress_text(dl_id: str) -> str:
+    with _dl_lock:
+        d = _downloads.get(dl_id, {})
+    status = d.get("status", "queued")
+    lines  = d.get("output", [])
+    last   = [l for l in lines[-6:] if l.strip()]
+    icons  = {"queued": "⏳", "searching": "🔍", "downloading": "⬇️",
+               "done": "✅", "error": "❌", "paused": "⏸"}
+    icon   = icons.get(status, "⏳")
+    text   = f"{icon} *Download* — {status}\n"
+    if last:
+        text += "```\n" + "\n".join(last) + "\n```"
+    return text
+
+def _progress_keyboard(dl_id: str) -> str:
+    with _dl_lock:
+        status = _downloads.get(dl_id, {}).get("status", "queued")
+    rows = []
+    if status in ("downloading", "searching", "queued"):
+        rows.append([
+            {"text": "⏸ Pause",    "callback_data": f"dl:pause:{dl_id}"},
+            {"text": "❌ Cancel",  "callback_data": f"dl:abort:{dl_id}"},
+        ])
+    elif status == "paused":
+        rows.append([
+            {"text": "▶️ Resume",  "callback_data": f"dl:resume:{dl_id}"},
+            {"text": "❌ Cancel",  "callback_data": f"dl:abort:{dl_id}"},
+        ])
+    rows.append([{"text": "🗑 Clear", "callback_data": f"dl:clear:{dl_id}"}])
+    return json.dumps({"inline_keyboard": rows})
+
+def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
+    """Background thread: edit progress message every 4s until terminal state."""
+    terminal = {"done", "error"}
+    while True:
+        time.sleep(4)
+        text = _progress_text(dl_id)
+        kb   = _progress_keyboard(dl_id)
+        _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                 text=text, parse_mode="Markdown", reply_markup=kb)
+        with _dl_lock:
+            status = _downloads.get(dl_id, {}).get("status", "error")
+        if status in terminal:
+            break
+
+def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list):
+    """Queue already-chosen files from slskd and monitor (no search step)."""
+    with _dl_lock:
+        _downloads[dl_id].update({"status": "downloading",
+                                   "started": datetime.now().isoformat(timespec="seconds")})
+    payload = [{"filename": f["filename"], "size": f.get("size", 0)} for f in files_to_dl]
+    dl_res  = _slskd("POST", f"/api/v0/transfers/downloads/{username}", payload)
+    if isinstance(dl_res, dict) and "_error" in dl_res:
+        _dl_log(dl_id, f"ERROR: Queue failed: {dl_res}")
+        with _dl_lock:
+            _downloads[dl_id].update({"status": "error",
+                                       "finished": datetime.now().isoformat(timespec="seconds")})
+        return
+
+    queued_filenames = {f["filename"] for f in files_to_dl}
+    total            = len(queued_filenames)
+    ever_seen        = False
+    confirmed_done: set = set()
+    confirmed_fail: set = set()
+
+    for _ in range(1800):
+        time.sleep(2)
+        with _dl_lock:
+            if _downloads[dl_id].get("status") == "paused":
+                time.sleep(3); continue
+
+        transfers = _slskd("GET", "/api/v0/transfers/downloads")
+        if isinstance(transfers, dict) and "_error" in transfers:
+            continue
+
+        states: dict = {}
+        for peer_group in (transfers if isinstance(transfers, list) else []):
+            if peer_group.get("username") != username:
+                continue
+            for d in peer_group.get("directories", []):
+                for f in d.get("files", []):
+                    if f.get("filename") in queued_filenames:
+                        states[f["filename"]] = f
+
+        if states:
+            ever_seen = True
+            for fname, finfo in states.items():
+                s = finfo.get("state", "")
+                if "Completed" in s and "Succeeded" in s:
+                    confirmed_done.add(fname)
+                elif "Completed" in s:
+                    confirmed_fail.add(fname)
+        elif not ever_seen:
+            break
+
+        cleared = queued_filenames - set(states.keys()) - confirmed_done - confirmed_fail
+        n_done  = len(confirmed_done) + len(cleared)
+        n_error = len(confirmed_fail)
+        avg_pct = (sum(f.get("percentComplete", 0) for f in states.values()) / len(states)
+                   if states else 100)
+        _dl_log(dl_id, f"{n_done}/{total} done, {n_error} errors — {avg_pct:.0f}% avg")
+
+        if n_done + n_error >= total or (not states and ever_seen):
+            ok = n_error == 0
+            with _dl_lock:
+                _downloads[dl_id].update({
+                    "status": "done" if ok else "error",
+                    "finished": datetime.now().isoformat(timespec="seconds"),
+                })
+            _dl_log(dl_id, "Done!" if ok else f"{n_error}/{total} files failed")
+            return
+
+    _dl_log(dl_id, "ERROR: Timed out")
+    with _dl_lock:
+        _downloads[dl_id].update({"status": "error",
+                                   "finished": datetime.now().isoformat(timespec="seconds")})
+
+def _start_dl(chat_id: int, session: dict):
+    """Kick off download from the currently selected result."""
+    idx  = session.get("idx", 0)
+    r    = session.get("results", [])[idx]
+    kind = session.get("kind", "track")
+    meta = session.get("meta", {})
+
+    dl_id = str(uuid.uuid4())[:8]
+    label = meta.get("title") or session.get("query", "?")
+    with _dl_lock:
+        _downloads[dl_id] = {"track": {"artist": session.get("artist",""),
+                                        "name": session.get("query",""),
+                                        "album": ""},
+                              "status": "queued", "output": [],
+                              "started": None, "finished": None}
+
+    session["dl_id"] = dl_id
+    _sess_set(chat_id, session)
+
+    # Send progress message
+    res    = tg_send(chat_id, _progress_text(dl_id), reply_markup=_progress_keyboard(dl_id))
+    msg_id = res.get("result", {}).get("message_id")
+
+    if r.get("source") == "yt":
+        threading.Thread(target=_ytdl_download_worker,
+                         args=(dl_id, r["video_id"],
+                               session.get("artist", ""), label),
+                         daemon=True).start()
+    else:
+        username    = r["username"]
+        files_to_dl = r.get("files", [])
+        if kind == "track":
+            q_name = session.get("query", "")
+            files_to_dl = [
+                next((f for f in files_to_dl
+                      if _norm(q_name) in _norm(f["filename"].rsplit("\\", 1)[-1].rsplit(".", 1)[0])),
+                     files_to_dl[0])
+            ] if files_to_dl else []
+            files_to_dl = [f for f in files_to_dl
+                           if "." + f["filename"].rsplit(".", 1)[-1].lower() in AUDIO_DL_EXTS]
+        threading.Thread(target=_slskd_download_chosen,
+                         args=(dl_id, username, files_to_dl),
+                         daemon=True).start()
+
+    if msg_id:
+        threading.Thread(target=_monitor_download,
+                         args=(chat_id, dl_id, msg_id), daemon=True).start()
+
+
+def handle_download_start(chat_id: int):
+    _sess_set(chat_id, {"step": "ask_kind"})
+    kb = _inline([[
+        {"text": "🎵 Track",  "callback_data": "dl:kind:track"},
+        {"text": "💿 Album",  "callback_data": "dl:kind:album"},
+    ]])
+    tg_send(chat_id, "What do you want to download?", reply_markup=kb)
+
+
+def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
+    kind  = session.get("kind", "track")
+    query = session.get("query", "")
+    artist= session.get("artist", "")
+    q     = f"{artist} {query}".strip() if artist else query
+
+    folders = _slskd_search_only(q)
+
+    if not folders:
+        # No results
+        session["step"] = "no_results"
+        _sess_set(chat_id, session)
+        kb = _inline([[
+            {"text": "🔁 Retry",              "callback_data": "dl:retry_slskd"},
+            {"text": "▶️ Retry with YouTube", "callback_data": "dl:retry_yt"},
+            {"text": "❌ Cancel",             "callback_data": "dl:cancel"},
+        ]])
+        _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                 text=f"😕 No results on Soulseek for *{q}*", parse_mode="Markdown",
+                 reply_markup=json.dumps({"inline_keyboard": [[
+                     {"text": "🔁 Retry",              "callback_data": "dl:retry_slskd"},
+                     {"text": "▶️ Retry with YouTube", "callback_data": "dl:retry_yt"},
+                 ],[
+                     {"text": "❌ Cancel",             "callback_data": "dl:cancel"},
+                 ]]}))
+        return
+
+    # Attach source tag to each folder
+    for f in folders:
+        f["source"] = "slskd"
+
+    meta = _itunes_meta(artist, query, kind)
+
+    session.update({"step": "results", "results": folders[:10],
+                    "idx": 0, "meta": meta})
+    _sess_set(chat_id, session)
+
+    # Delete the "Searching…" message
+    _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+    _show_result(chat_id, session)
+
+
+def _do_yt_search(chat_id: int, session: dict, msg_id: int):
+    kind  = session.get("kind", "track")
+    query = session.get("query", "")
+    artist= session.get("artist", "")
+    q     = f"{artist} {query}".strip() if artist else query
+
+    items = _ytdl_search(q)
+
+    if not items:
+        kb = json.dumps({"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "dl:cancel"}]]})
+        _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                 text=f"😕 No YouTube results for *{q}*",
+                 parse_mode="Markdown", reply_markup=kb)
+        return
+
+    # Build result objects compatible with _result_text
+    yt_results = [dict(r, source="yt") for r in items]
+    meta = _itunes_meta(artist, query, kind)
+
+    session.update({"step": "results", "results": yt_results,
+                    "idx": 0, "meta": meta})
+    _sess_set(chat_id, session)
+
+    _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+    _show_result(chat_id, session)
+
+
+def handle_callback(cq: dict):
+    """Handle all dl:* inline keyboard callbacks."""
+    cq_id   = cq.get("id", "")
+    data    = cq.get("data", "")
+    chat_id = cq.get("message", {}).get("chat", {}).get("id")
+    if not chat_id:
+        return
+    _tg_call("answerCallbackQuery", callback_query_id=cq_id)
+
+    session = _sess_get(chat_id)
+    parts   = data.split(":")
+
+    if data == "dl:noop":
+        return
+
+    # ── Kind selection ────────────────────────────────────────────────────────
+    if len(parts) == 3 and parts[0] == "dl" and parts[1] == "kind":
+        kind = parts[2]
+        session.update({"kind": kind, "step": "ask_query"})
+        _sess_set(chat_id, session)
+        label = "album" if kind == "album" else "track"
+        # Edit the kind-selection message to remove buttons
+        msg_id = cq.get("message", {}).get("message_id")
+        if msg_id:
+            _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
+                     reply_markup=json.dumps({"inline_keyboard": []}))
+        tg_send(chat_id, f"Enter *artist — {label} title*:", reply_markup=TG_KEYBOARD)
+        return
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    if data == "dl:prev":
+        session["idx"] = max(0, session.get("idx", 0) - 1)
+        _sess_set(chat_id, session)
+        _show_result(chat_id, session)
+        return
+
+    if data == "dl:next":
+        total = len(session.get("results", []))
+        session["idx"] = min(total - 1, session.get("idx", 0) + 1)
+        _sess_set(chat_id, session)
+        _show_result(chat_id, session)
+        return
+
+    # ── Download ──────────────────────────────────────────────────────────────
+    if data == "dl:download":
+        results = session.get("results", [])
+        if not results:
+            return
+        # Remove result keyboard
+        msg_id = session.get("result_msg_id")
+        if msg_id:
+            _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
+                     reply_markup=json.dumps({"inline_keyboard": []}))
+        _start_dl(chat_id, session)
+        return
+
+    # ── Cancel ────────────────────────────────────────────────────────────────
+    if data == "dl:cancel":
+        msg_id = cq.get("message", {}).get("message_id")
+        if msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        _sess_set(chat_id, {})
+        tg_send(chat_id, "Cancelled.", reply_markup=TG_KEYBOARD)
+        return
+
+    # ── Retry Soulseek ────────────────────────────────────────────────────────
+    if data == "dl:retry_slskd":
+        msg_id = cq.get("message", {}).get("message_id")
+        q = (session.get("artist", "") + " " + session.get("query", "")).strip()
+        if msg_id:
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=f"🔍 Searching Soulseek for *{q}*…", parse_mode="Markdown",
+                     reply_markup=json.dumps({"inline_keyboard": []}))
+        threading.Thread(target=_do_slskd_search,
+                         args=(chat_id, session, msg_id), daemon=True).start()
+        return
+
+    # ── Retry YouTube ─────────────────────────────────────────────────────────
+    if data == "dl:retry_yt":
+        msg_id = cq.get("message", {}).get("message_id")
+        q = (session.get("artist", "") + " " + session.get("query", "")).strip()
+        if msg_id:
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=f"🔍 Searching YouTube for *{q}*…", parse_mode="Markdown",
+                     reply_markup=json.dumps({"inline_keyboard": []}))
+        threading.Thread(target=_do_yt_search,
+                         args=(chat_id, session, msg_id), daemon=True).start()
+        return
+
+    # ── Pause/Resume/Abort/Clear ──────────────────────────────────────────────
+    if len(parts) >= 3 and parts[0] == "dl" and parts[1] in ("pause", "resume", "abort", "clear"):
+        action = parts[1]
+        dl_id  = parts[2]
+        msg_id = cq.get("message", {}).get("message_id")
+        with _dl_lock:
+            d = _downloads.get(dl_id, {})
+            if action == "pause" and d.get("status") == "downloading":
+                _downloads[dl_id]["status"] = "paused"
+            elif action == "resume" and d.get("status") == "paused":
+                _downloads[dl_id]["status"] = "downloading"
+            elif action == "abort":
+                _downloads[dl_id]["status"] = "error"
+                _dl_log(dl_id, "Cancelled by user.")
+            elif action == "clear":
+                pass  # just remove the message
+        if action == "clear" and msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+            _sess_set(chat_id, {})
+            tg_send(chat_id, "Cleared.", reply_markup=TG_KEYBOARD)
+            return
+        if msg_id:
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=_progress_text(dl_id), parse_mode="Markdown",
+                     reply_markup=_progress_keyboard(dl_id))
+        return
+
+
 def handle_tg(chat_id, text):
-    tg_send(chat_id, "🛠 Bot is being rebuilt. Stay tuned.", reply_markup=TG_KEYBOARD)
+    session = _sess_get(chat_id)
+    step    = session.get("step")
+
+    # ── Intercept query input ─────────────────────────────────────────────────
+    if step == "ask_query":
+        raw = text.strip()
+        if " - " in raw:
+            artist, rest = raw.split(" - ", 1)
+        else:
+            artist, rest = "", raw
+        session.update({"artist": artist.strip(), "query": rest.strip(),
+                        "step": "searching"})
+        _sess_set(chat_id, session)
+        q = (artist.strip() + " " + rest.strip()).strip()
+        res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{q}*…")
+        msg_id = res.get("result", {}).get("message_id")
+        threading.Thread(target=_do_slskd_search,
+                         args=(chat_id, session, msg_id), daemon=True).start()
+        return
+
+    # ── Main menu commands ────────────────────────────────────────────────────
+    t = text.lower()
+    if "download" in t or "⬇️" in text:
+        handle_download_start(chat_id)
+        return
+
+    tg_send(chat_id, "Tap *⬇️ Download Tracks* to get started.", reply_markup=TG_KEYBOARD)
 
 def telegram_loop():
     if not BOT_TOKEN:
@@ -1765,13 +2357,29 @@ def telegram_loop():
         try:
             res = _tg_call("getUpdates", offset=offset, timeout=30)
             for upd in res.get("result", []):
-                offset  = upd["update_id"] + 1
-                msg     = upd.get("message", {})
-                chat_id = msg.get("chat", {}).get("id")
-                log.info("TG msg from chat_id=%s", chat_id)
-                if not chat_id or (ALLOWED_IDS and str(chat_id) not in ALLOWED_IDS): continue
-                text = (msg.get("text") or "").strip()
-                if text: handle_tg(chat_id, text)
+                offset = upd["update_id"] + 1
+
+                # ── Regular message ───────────────────────────────────────────
+                msg = upd.get("message", {})
+                if msg:
+                    chat_id = msg.get("chat", {}).get("id")
+                    if not chat_id or (ALLOWED_IDS and str(chat_id) not in ALLOWED_IDS):
+                        continue
+                    text = (msg.get("text") or "").strip()
+                    if text:
+                        handle_tg(chat_id, text)
+                    continue
+
+                # ── Inline button callback ────────────────────────────────────
+                cq = upd.get("callback_query", {})
+                if cq:
+                    chat_id = cq.get("message", {}).get("chat", {}).get("id")
+                    if not chat_id or (ALLOWED_IDS and str(chat_id) not in ALLOWED_IDS):
+                        _tg_call("answerCallbackQuery", callback_query_id=cq.get("id",""))
+                        continue
+                    data = cq.get("data", "")
+                    if data.startswith("dl:"):
+                        handle_callback(cq)
         except Exception as e:
             log.error("Telegram poll: %s", e); time.sleep(5)
 
