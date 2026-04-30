@@ -1,5 +1,5 @@
 #!/bin/bash
-# Beets full library sync: import, art, embed, lyrics
+# Beets full library sync: import, art, embed, organize, lyrics
 set -uo pipefail
 LOG=/DATA/AppData/beets/cron.log
 exec >> "$LOG" 2>&1
@@ -8,5 +8,6 @@ docker exec beets beet import /music -q
 docker exec beets beet import /evymusics -q
 docker exec beets beet fetchart
 docker exec beets beet embedart -y
+docker exec beets python3 /config/beet-organize.py
 python3 /DATA/AppData/beets/all-lyrics.py
 echo "=== [$(date)] beets-cron done ==="

@@ -372,7 +372,11 @@ def _run_watch_pipeline(dir_path, files):
             subprocess.run(
                 'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
                 shell=True, capture_output=True, text=True, timeout=1800)
-            # Refresh ALL dirs: fetchart/embedart modify files across the whole library
+            # Organize: move Soulseek downloads into library structure
+            subprocess.run(
+                'docker exec beets python3 /config/beet-organize.py',
+                shell=True, capture_output=True, text=True, timeout=1800)
+            # Refresh ALL dirs: fetchart/embedart/organize modify files across the whole library
             _refresh_all_watch_dirs()
             # Lyrics also run once at the end
             if not is_batch:
