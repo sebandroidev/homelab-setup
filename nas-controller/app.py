@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NAS Controller — cron jobs, file watcher, Spotify import, Telegram bot."""
 
-import csv, io, json, logging, os, re, subprocess, threading, time, urllib.parse, urllib.request, uuid, urllib.error
+import csv, hashlib, hmac, io, json, logging, os, re, subprocess, threading, time, urllib.parse, urllib.request, uuid, urllib.error
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify, Response, request, redirect
@@ -88,7 +88,7 @@ TG_KEYBOARD = json.dumps({
         [{"text": "🎵 Run Beets"},       {"text": "📝 Run Lyrics"}],
         [{"text": "🔧 Run Lrclib"},      {"text": "🔍 Run Explo"}],
         [{"text": "🌐 Services"},        {"text": "💾 Backup"}],
-        [{"text": "🔇 Mute"},              {"text": "🔔 Unmute"}],
+        [{"text": "🔎 Search"},           {"text": "🔇 Mute"},    {"text": "🔔 Unmute"}],
     ],
     "resize_keyboard": True,
     "persistent": True,
@@ -122,6 +122,9 @@ _mute_until          = 0.0    # epoch time until which notifications are silence
 _last_notify_time    = 0.0
 _NOTIFY_MIN_INTERVAL = 15.0   # seconds — min gap between non-forced notifications
 _notify_state_lock   = threading.Lock()
+
+# Free-search state: chat_ids waiting for a search query message
+_search_pending: set = set()
 
 # Spotify
 _spotify: dict = {
@@ -1585,6 +1588,20 @@ def discover_refresh():
     threading.Thread(target=_refresh_discover, daemon=True).start()
     return jsonify({"status": "started"})
 
+@app.route("/webhook/deploy", methods=["POST"])
+def webhook_deploy():
+    sig    = request.headers.get("X-Hub-Signature-256", "")
+    secret = os.getenv("DEPLOY_SECRET", "").encode()
+    if secret:
+        expected = "sha256=" + hmac.new(secret, request.data, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return jsonify({"error": "invalid signature"}), 403
+    def _deploy():
+        time.sleep(1)
+        subprocess.run("/DATA/homelab-setup/deploy.sh", shell=True)
+    threading.Thread(target=_deploy, daemon=True).start()
+    return jsonify({"status": "deploying"}), 200
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def _tg_call(method, **kwargs):
     url  = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -1796,6 +1813,28 @@ def handle_tg_csv_file(chat_id, doc):
     except Exception as e:
         tg_send(chat_id, f"❌ Error parsing CSV: {e}")
 
+def _run_search_download(chat_id: int, query: str):
+    """Parse a free-text query and kick off a slskd download, with live status."""
+    # "Artist - Track" → track mode;  "Artist - Album" resolved by _download_worker
+    if " - " in query:
+        artist, rest = query.split(" - ", 1)
+        track = {"artist": artist.strip(), "name": rest.strip(), "album": ""}
+    else:
+        # Treat as album/free search: pass whole string as artist, worker uses it as query
+        track = {"artist": query.strip(), "name": "", "album": ""}
+    tg_send(chat_id, f"🔍 Searching slskd for `{query}`…")
+    def _worker(t=track, cid=chat_id, q=query):
+        dl_id = start_download(t)
+        while True:
+            with _dl_lock:
+                s = _downloads.get(dl_id, {}).get("status", "queued")
+            if s in ("done", "error"): break
+            time.sleep(3)
+        icon = "✅" if s == "done" else "❌"
+        tg_send(cid, f"{icon} `{q}` — {'downloaded!' if s == 'done' else 'download failed'}")
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def handle_tg(chat_id, text):
     global _mute_until
     parts = text.strip().split()
@@ -1803,6 +1842,12 @@ def handle_tg(chat_id, text):
     # If first token is a pure emoji (non-ASCII), use last word as the command
     cmd = parts[-1].lower().lstrip("/").split("@")[0] if (first and not first.isascii()) else first
     args = parts[1:] if first.startswith("/") else []
+
+    # Free-search mode: previous message asked for a query — treat this message as the query
+    if chat_id in _search_pending and not text.startswith("/"):
+        _search_pending.discard(chat_id)
+        _run_search_download(chat_id, text.strip())
+        return
 
     if cmd in ("start", "help"):
         tg_send(chat_id, (
@@ -1812,6 +1857,9 @@ def handle_tg(chat_id, text):
             "\n\n*Watcher:*\n"
             "/watcher — status\n/pause\\_watcher — pause\n/resume\\_watcher — resume\n"
             "/refresh\\_index — re-index all audio files\n\n"
+            "*Search & Download:*\n"
+            "/search [query] — search slskd and download\n"
+            "  `Artist - Track` · `Artist - Album` · free text\n\n"
             "*Notifications:*\n"
             "/mute [minutes] — silence bot (default 30 min)\n/unmute — re-enable\n\n"
             "*Spotify Import:*\n"
@@ -1905,6 +1953,23 @@ def handle_tg(chat_id, text):
         tg_send(chat_id, "🔄 Refreshing file index…")
         _refresh_all_watch_dirs()
         tg_send(chat_id, f"✅ Index refreshed — {len(_seen_files)} files indexed"); return
+
+    if cmd == "search":
+        query = " ".join(args).strip()
+        if query:
+            # Inline: /search Artist - Track
+            _run_search_download(chat_id, query)
+        else:
+            # Keyboard button or bare /search — ask for the query
+            _search_pending.add(chat_id)
+            tg_send(chat_id,
+                "🔍 *Search & Download*\n\n"
+                "Send your query:\n"
+                "• `Artist - Track` — single track\n"
+                "• `Artist - Album` — full album\n"
+                "• `Free text` — best match\n\n"
+                "_Next message will be used as the query._")
+        return
 
     if cmd == "load_navidrome":
         tg_send(chat_id, "⏳ Indexing Navidrome library…")
