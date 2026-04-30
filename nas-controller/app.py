@@ -2063,7 +2063,7 @@ def _progress_keyboard(dl_id: str) -> str:
 
 def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
     """Background thread: edit progress message every 4s until terminal state."""
-    terminal = {"done", "error", "stalled"}
+    terminal = {"done", "error"}
     while True:
         time.sleep(4)
         text = _progress_text(dl_id)
@@ -2099,12 +2099,19 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
     confirmed_done: set = set()
     confirmed_fail: set = set()
     queued_since     = time.time()
+    stall_notif_id: int = 0  # message_id of the current stall notification
 
     for _ in range(1800):
         time.sleep(2)
         with _dl_lock:
-            if _downloads[dl_id].get("status") == "paused":
+            st = _downloads[dl_id].get("status")
+            if st == "paused":
                 time.sleep(3); continue
+            # "Keep waiting" button pressed — reset stall clock
+            if _downloads[dl_id].pop("stall_reset", False):
+                queued_since = time.time()
+                stall_notif_id = 0
+                _downloads[dl_id]["status"] = "downloading"
 
         transfers = _slskd("GET", "/api/v0/transfers/downloads")
         if isinstance(transfers, dict) and "_error" in transfers:
@@ -2136,27 +2143,26 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
 
         elif not ever_seen:
             # Files not visible yet — check stall timeout
-            if time.time() - queued_since > stall_limit:
+            if time.time() - queued_since > stall_limit and not stall_notif_id:
                 waited = int(time.time() - queued_since)
                 _dl_log(dl_id, f"Stalled — no transfer started after {waited}s")
                 with _dl_lock:
-                    _downloads[dl_id].update({
-                        "status": "stalled",
-                        "finished": datetime.now().isoformat(timespec="seconds"),
-                    })
+                    _downloads[dl_id]["status"] = "stalled"
                 if chat_id:
-                    label = _downloads[dl_id].get("track", {}).get("name", "")
-                    mins  = stall_limit // 60
-                    kb    = json.dumps({"inline_keyboard": [[
+                    mins = stall_limit // 60
+                    kb   = json.dumps({"inline_keyboard": [[
                         {"text": "▶️ Try YouTube instead", "callback_data": f"dl:stall_yt:{dl_id}"},
+                        {"text": "⏳ Keep waiting",        "callback_data": f"dl:keep_waiting:{dl_id}"},
                         {"text": "❌ Cancel",              "callback_data": f"dl:cancel"},
                     ]]})
-                    tg_send(chat_id,
-                            f"🕐 *Soulseek is not responding*\n"
-                            f"No transfer started after {mins} min.\n"
-                            f"Peer `{username}` may be offline or busy.",
-                            reply_markup=kb)
-                return
+                    res = tg_send(chat_id,
+                                  f"🕐 *Soulseek is not responding*\n"
+                                  f"No transfer started after {mins} min.\n"
+                                  f"Peer `{username}` may be offline or busy.",
+                                  reply_markup=kb)
+                    stall_notif_id = res.get("result", {}).get("message_id", 0)
+                # Keep looping — user may press "Keep waiting"
+                continue
             break
 
         cleared = queued_filenames - set(states.keys()) - confirmed_done - confirmed_fail
@@ -2413,6 +2419,17 @@ def handle_callback(cq: dict):
         _sess_set(chat_id, session)
         threading.Thread(target=_do_yt_search,
                          args=(chat_id, session, new_id), daemon=True).start()
+        return
+
+    # ── Stall → Keep waiting (reset timer) ───────────────────────────────────
+    if len(parts) == 3 and parts[0] == "dl" and parts[1] == "keep_waiting":
+        dl_id  = parts[2]
+        msg_id = cq.get("message", {}).get("message_id")
+        with _dl_lock:
+            _downloads[dl_id]["stall_reset"] = True
+        if msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        tg_send(chat_id, "⏳ OK, still waiting for Soulseek… I'll let you know if it starts or stalls again.")
         return
 
     # ── Pause/Resume/Abort/Clear ──────────────────────────────────────────────
