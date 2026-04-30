@@ -5,4 +5,4 @@ RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.
 RUN pip install flask yt-dlp --no-cache-dir
 WORKDIR /app
 COPY app.py .
-CMD ["python", "app.py"]
+CMD ["python", "/DATA/AppData/nas-controller/app.py"]
