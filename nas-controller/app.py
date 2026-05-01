@@ -2639,20 +2639,26 @@ def _progress_keyboard(dl_id: str) -> str:
 
 def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
     """Background thread: edit progress message every 2s until terminal state."""
-    terminal = {"done", "error"}
+    terminal  = {"done", "error"}
+    last_text = ""
+    last_kb   = ""
     while True:
         time.sleep(2)
         text = _progress_text(dl_id)
         kb   = _progress_keyboard(dl_id)
-        _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                 text=text, parse_mode="Markdown", reply_markup=kb)
+        if text != last_text or kb != last_kb:
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=text, parse_mode="Markdown", reply_markup=kb)
+            last_text = text
+            last_kb   = kb
         with _dl_lock:
             status = _downloads.get(dl_id, {}).get("status", "error")
         if status in terminal:
-            # One final edit to show done state
-            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                     text=_progress_text(dl_id), parse_mode="Markdown",
-                     reply_markup=_progress_keyboard(dl_id))
+            final_text = _progress_text(dl_id)
+            final_kb   = _progress_keyboard(dl_id)
+            if final_text != last_text or final_kb != last_kb:
+                _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                         text=final_text, parse_mode="Markdown", reply_markup=final_kb)
             break
 
 def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
