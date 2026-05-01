@@ -2297,6 +2297,7 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
         "--embed-thumbnail",   # embed YT thumbnail as fallback cover art
         "--output", os.path.join(out_dir, "%(title)s.%(ext)s"),
         "--no-warnings",
+        "--newline",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
     with _dl_lock:
