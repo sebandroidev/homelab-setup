@@ -2556,14 +2556,15 @@ def _progress_text(dl_id: str) -> str:
     track    = d.get("track", {})
     lines    = d.get("output", [])
     icons = {"queued": "⏳", "searching": "🔍", "downloading": "⬇️",
+             "importing": "📥", "lyrics": "🎵", "art": "🎨",
              "done": "✅", "error": "❌", "paused": "⏸", "stalled": "🕐"}
     icon   = icons.get(status, "⏳")
     artist = track.get("artist", "")
-    title  = track.get("title", "")
+    title  = track.get("title") or track.get("name", "")
     label  = f"*{artist}* — {title}" if (artist or title) else "*Download*"
     text   = f"{icon} {label}\n"
 
-    if progress and status == "downloading":
+    if progress and status not in ("done", "error", "searching", "queued"):
         pct        = progress.get("pct", 0)
         stage      = progress.get("stage", "downloading")
         speed_bps  = progress.get("speed_bps", 0)
@@ -2589,8 +2590,8 @@ def _progress_text(dl_id: str) -> str:
                 text += "`" + "  ".join(parts) + "`\n"
             if n_done is not None and total_files:
                 text += f"Files: {n_done}/{total_files}\n"
-    elif status in ("done", "error"):
-        text += f"`{'▓' * 18}` 100%\n" if status == "done" else ""
+    elif status == "done":
+        text += f"`{'▓' * 18}` 100%\n"
         summary = (progress or {}).get("summary")
         if summary:
             text += f"`{summary}`\n"
@@ -2598,6 +2599,10 @@ def _progress_text(dl_id: str) -> str:
             last = [l for l in lines[-2:] if l.strip()]
             if last:
                 text += "```\n" + "\n".join(last) + "\n```"
+    elif status == "error":
+        last = [l for l in lines[-2:] if l.strip()]
+        if last:
+            text += "```\n" + "\n".join(last) + "\n```"
     elif status == "searching":
         last = [l for l in lines[-2:] if l.strip()]
         if last:
@@ -2781,6 +2786,7 @@ def _start_dl(chat_id: int, session: dict):
     with _dl_lock:
         _downloads[dl_id] = {"track": {"artist": session.get("artist",""),
                                         "name": session.get("query",""),
+                                        "title": meta.get("title") or session.get("query",""),
                                         "album": ""},
                               "status": "queued", "output": [],
                               "started": None, "finished": None}
