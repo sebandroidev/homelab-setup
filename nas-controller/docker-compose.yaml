@@ -23,6 +23,7 @@ services:
       - /media/sdb:/media/sdb
       - /DATA/AppData/beets:/DATA/AppData/beets
       - /DATA/AppData/nas-controller:/DATA/AppData/nas-controller
+      - /usr/bin/docker:/usr/bin/docker:ro
       - /DATA/AppData/navidrome:/DATA/AppData/navidrome
       - /DATA/homelab-setup:/DATA/homelab-setup
       - /DATA/.ssh:/DATA/.ssh:ro
