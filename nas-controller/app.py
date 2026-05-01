@@ -138,6 +138,13 @@ _disc_lock = threading.Lock()
 _dl_sessions: dict = {}
 _sess_lock = threading.Lock()
 
+# Telegram result message IDs — ephemeral, not persisted to Redis
+_result_msgs: dict = {}  # chat_id -> (msg_id, msg_type)
+
+# Background slskd searches: search_id -> {"done": bool, "folders": list}
+_bg_searches: dict = {}
+_bg_lock = threading.Lock()
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 def _load_history():
     global _history
@@ -362,20 +369,30 @@ def _run_watch_pipeline(dir_path, files):
         if not is_batch:
             _notify_tg(f"🔔 *New music detected!*\n📁 `{short}` ({count} track{'s' if count!=1 else ''})\n▶️ Running beets import…")
 
+        def _log_proc(label: str, r):
+            for line in (r.stdout + r.stderr).splitlines():
+                if line.strip():
+                    log.info("[beets:%s] %s", label, line.strip())
+            if r.returncode != 0:
+                log.warning("[beets:%s] exited %d", label, r.returncode)
+
         r1 = subprocess.run(
             f'docker exec beets beet import "{beets_dir}" -q',
             shell=True, capture_output=True, text=True, timeout=1800)
+        _log_proc("import", r1)
 
         lyrics_summary = ""
         if is_last:
             # fetchart + embedart run on whole library — do once after all imports
-            subprocess.run(
+            r_art = subprocess.run(
                 'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
                 shell=True, capture_output=True, text=True, timeout=1800)
+            _log_proc("art", r_art)
             # Organize: move Soulseek downloads into library structure
-            subprocess.run(
+            r_org = subprocess.run(
                 'docker exec beets python3 /config/beet-organize.py',
                 shell=True, capture_output=True, text=True, timeout=1800)
+            _log_proc("organize", r_org)
             # Refresh ALL dirs: fetchart/embedart/organize modify files across the whole library
             _refresh_all_watch_dirs()
             # Lyrics also run once at the end
@@ -383,8 +400,24 @@ def _run_watch_pipeline(dir_path, files):
                 _notify_tg("▶️ Running lyrics fetch…")
             r2 = subprocess.run("python3 /DATA/AppData/beets/all-lyrics.py",
                 shell=True, capture_output=True, text=True, timeout=3600)
+            _log_proc("lyrics", r2)
+            # Fallback: if script logged to file instead of stdout, read the summary line
             lyrics_summary = next(
                 (l.strip() for l in (r2.stdout + r2.stderr).splitlines() if "Done:" in l), "")
+            if not lyrics_summary:
+                try:
+                    with open("/data/logs/flac-lyrics.log") as _lf:
+                        for _line in _lf:
+                            if "Done:" in _line:
+                                lyrics_summary = _line.strip()
+                except Exception:
+                    pass
+            # Navidrome rescan so new tracks appear immediately
+            try:
+                _nav_request("startScan")
+                log.info("Navidrome rescan triggered")
+            except Exception as _e:
+                log.warning("Navidrome rescan failed: %s", _e)
         else:
             # More pipelines queued — skip global tasks, just note it
             lyrics_summary = "art+lyrics after remaining imports"
@@ -523,6 +556,8 @@ def _slskd(method: str, path: str, body=None):
             return json.loads(r.read()) if r.length != 0 else {}
     except urllib.error.HTTPError as e:
         return {"_error": e.code, "_body": e.read().decode()}
+    except Exception as e:
+        return {"_error": str(e)}
 
 def _dl_log(dl_id: str, msg: str):
     with _dl_lock:
@@ -532,11 +567,22 @@ def _dl_log(dl_id: str, msg: str):
 
 AUDIO_DL_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
 
-def _peer_folders(results: list, prefer_flac: bool = True) -> list:
+def _active_peers_only(peers: list) -> list:
+    """Keep only peers that appear online with upload capacity."""
+    return [
+        p for p in peers
+        if p.get("hasFreeUploadSlot")
+        or p.get("uploadSlots", 0) > 0
+        or p.get("freeUploadSlots", 0) > 0
+    ]
+
+def _peer_folders(results: list, prefer_flac: bool = True, active_only: bool = False) -> list:
     """
     Group every peer's files by their parent folder.
     Returns list of dicts sorted by (flac_count desc, total_size desc).
     """
+    if active_only:
+        results = _active_peers_only(results)
     folders = {}  # (username, folder_path) -> {files, flac_count, total_size, slots}
     for peer in results:
         username = peer.get("username", "")
@@ -1606,12 +1652,26 @@ def webhook_deploy():
 def _tg_call(method, _timeout=10, **kwargs):
     url  = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(kwargs).encode()
-    try:
-        with urllib.request.urlopen(url, data, timeout=_timeout) as r:
-            return json.loads(r.read())
-    except Exception as e:
-        lvl = log.debug if "timed out" in str(e).lower() else log.warning
-        lvl("Telegram %s: %s", method, e); return {}
+    # getUpdates uses long-polling — one attempt only, caller loop handles retries
+    max_attempts = 1 if method == "getUpdates" else 4
+    delays = [5, 15, 30]
+    for attempt in range(max_attempts):
+        try:
+            with urllib.request.urlopen(url, data, timeout=_timeout) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            is_dns = "name resolution" in str(e).lower() or "errno -3" in str(e).lower()
+            is_timeout = "timed out" in str(e).lower()
+            if attempt < max_attempts - 1 and (is_dns or is_timeout):
+                delay = delays[min(attempt, len(delays) - 1)]
+                log.warning("Telegram %s: %s — retrying in %ds (attempt %d/%d)",
+                            method, e, delay, attempt + 1, max_attempts)
+                time.sleep(delay)
+            else:
+                lvl = log.debug if is_timeout else log.warning
+                lvl("Telegram %s: %s", method, e)
+                break  # non-retryable error
+    return {}
 
 def _notify_tg(text, force=False):
     global _last_notify_time
@@ -2014,26 +2074,73 @@ def _fetch_meta(artist: str, title: str, kind: str) -> dict:
     return {"title": "", "artist": artist or "", "album": "", "year": "", "genre": "",
             "artwork_url": artwork}
 
-def _slskd_search_only(query: str) -> list:
-    """Run a slskd search and return ranked folder list (no download)."""
+def _slskd_bg_continue(search_id: str, tick_start: int):
+    """Background thread: wait for search completion, store full active-peer results."""
+    try:
+        for tick in range(tick_start, 50):
+            time.sleep(1)
+            info = _slskd("GET", f"/api/v0/searches/{search_id}")
+            if "Completed" in info.get("state", "") or info.get("isComplete"):
+                break
+        resp    = _slskd("GET", f"/api/v0/searches/{search_id}/responses")
+        raw     = resp if isinstance(resp, list) else resp.get("responses", [])
+        folders = _peer_folders(raw, active_only=True)
+    except Exception as e:
+        log.warning("bg search %s error: %s", search_id, e)
+        folders = []
+    finally:
+        try:
+            _slskd("DELETE", f"/api/v0/searches/{search_id}")
+        except Exception:
+            pass
+    with _bg_lock:
+        if search_id in _bg_searches:
+            _bg_searches[search_id].update({"done": True, "folders": folders})
+    log.info("bg search %s done — %d active folders total", search_id, len(folders))
+
+def _slskd_search_progressive(query: str):
+    """
+    Start a slskd search and return (search_id, first_5_folders) quickly.
+    Breaks after collecting ≥5 active peers (min 4s), then continues in background.
+    Returns (None, []) on failure.
+    """
     res = _slskd("POST", "/api/v0/searches",
                  {"searchText": query, "responseLimit": 30, "fileLimit": 500})
     if "_error" in res:
-        return []
+        return None, []
     search_id = res.get("id")
     if not search_id:
-        return []
+        return None, []
+
+    snap_raw = []
     for tick in range(30):
         time.sleep(1)
-        info = _slskd("GET", f"/api/v0/searches/{search_id}")
+        info      = _slskd("GET", f"/api/v0/searches/{search_id}")
         completed = "Completed" in info.get("state", "") or info.get("isComplete")
-        enough    = info.get("responseCount", 0) >= 5
-        if completed or (enough and tick >= 4):  # at least 4s + 5 peers
-            break
-    resp    = _slskd("GET", f"/api/v0/searches/{search_id}/responses")
-    results = resp if isinstance(resp, list) else resp.get("responses", [])
-    _slskd("DELETE", f"/api/v0/searches/{search_id}")
-    return _peer_folders(results)
+        resp      = _slskd("GET", f"/api/v0/searches/{search_id}/responses")
+        snap_raw  = resp if isinstance(resp, list) else resp.get("responses", [])
+        active    = _active_peers_only(snap_raw)
+        enough    = len(active) >= 5 and tick >= 4
+        if completed or enough:
+            if completed:
+                folders = _peer_folders(snap_raw, active_only=True)
+                with _bg_lock:
+                    _bg_searches[search_id] = {"done": True, "folders": folders}
+                try:
+                    _slskd("DELETE", f"/api/v0/searches/{search_id}")
+                except Exception:
+                    pass
+                return search_id, folders[:5]
+            break  # enough active peers — hand off to background
+
+    # Snapshot first page, let background collect the rest
+    first = _peer_folders(snap_raw, active_only=True)[:5]
+    with _bg_lock:
+        _bg_searches[search_id] = {"done": False, "folders": []}
+    threading.Thread(
+        target=_slskd_bg_continue, args=(search_id, tick + 1), daemon=True
+    ).start()
+    return search_id, first
 
 _YT_JUNK = {"paroles", "parole vidéo", "parole video", "lyric video", "lyric vid",
              "lyrics video", "lyrics", "karaoke", "instrumental",
@@ -2095,8 +2202,8 @@ def _inject_tags(flac_path: str, meta: dict):
     title  = meta.get("title", "")
     year   = meta.get("year", "")
     genre  = meta.get("genre", "")
-    if not (artist and album and title):
-        return  # not enough to be worth injecting
+    if not (artist and title):
+        return  # need at least artist + title
     container_path = _host_to_beets_path(flac_path)
     script = (
         f"import mutagen.flac\n"
@@ -2124,6 +2231,7 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
         "yt-dlp",
         "--extract-audio", "--audio-format", "flac", "--audio-quality", "0",
         "--embed-metadata", "--add-metadata",
+        "--embed-thumbnail",   # embed YT thumbnail as fallback cover art
         "--output", os.path.join(out_dir, "%(title)s.%(ext)s"),
         "--no-warnings",
         f"https://www.youtube.com/watch?v={video_id}",
@@ -2138,17 +2246,42 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
             _dl_log(dl_id, line.rstrip())
         proc.wait()
         ok = proc.returncode == 0
-        if ok and meta and meta.get("album"):
-            # Inject clean iTunes tags so beet-organize can move the file correctly
-            _dl_log(dl_id, "Injecting iTunes metadata…")
+        if ok and meta:
             flac_files = [
                 os.path.join(out_dir, f) for f in os.listdir(out_dir)
                 if f.lower().endswith(".flac")
             ]
-            for fpath in flac_files:
-                result = _inject_tags(fpath, meta)
-                if result:
-                    _dl_log(dl_id, result)
+            if flac_files:
+                _dl_log(dl_id, "Injecting metadata tags…")
+                injected = False
+                for fpath in flac_files:
+                    result = _inject_tags(fpath, meta)
+                    if result:
+                        _dl_log(dl_id, result)
+                        injected = True
+                    else:
+                        _dl_log(dl_id, "Tag injection skipped (missing artist/title)")
+                if injected:
+                    # Force beet re-import with clean tags (bypass incremental,
+                    # in case watcher already ran 'asis' before inject completed)
+                    beets_dir = _beets_path(out_dir)
+                    _dl_log(dl_id, f"Re-importing via beets: {beets_dir}")
+                    r_imp = sp.run(
+                        f'docker exec beets beet import --noincremental -q "{beets_dir}"',
+                        shell=True, capture_output=True, text=True, timeout=300)
+                    for line in (r_imp.stdout + r_imp.stderr).splitlines():
+                        if line.strip():
+                            _dl_log(dl_id, f"[beets] {line.strip()}")
+                            log.info("[beets:yt-import] %s", line.strip())
+                    # Refresh cover art for newly imported item
+                    _dl_log(dl_id, "Fetching cover art…")
+                    r_art = sp.run(
+                        "docker exec beets beet fetchart ; docker exec beets beet embedart -y",
+                        shell=True, capture_output=True, text=True, timeout=300)
+                    for line in (r_art.stdout + r_art.stderr).splitlines():
+                        if line.strip():
+                            _dl_log(dl_id, f"[beets] {line.strip()}")
+                            log.info("[beets:yt-art] %s", line.strip())
         with _dl_lock:
             _downloads[dl_id].update({
                 "status": "done" if ok else "error",
@@ -2205,16 +2338,31 @@ def _result_text(session: dict, idx: int) -> str:
                      (f"  •  {r.get('duration','')}" if r.get('duration') else ""))
         lines.append("🔴 YouTube")
 
-    lines.append(f"\n_{idx + 1}/{total}_")
+    footer = f"\n_{idx + 1}/{total}_"
+    if idx == total - 1 and session.get("bg_search_id"):
+        with _bg_lock:
+            bg = _bg_searches.get(session["bg_search_id"], {})
+        if not bg.get("done"):
+            footer += " · ⏳ more loading…"
+    lines.append(footer)
     return "\n".join(lines)
 
-def _result_keyboard(idx: int, total: int, source: str = "slskd") -> str:
+def _result_keyboard(idx: int, total: int, source: str = "slskd",
+                     bg_search_id: str = None) -> str:
     nav_row = []
     if idx > 0:
-        nav_row.append({"text": "← Prev",   "callback_data": f"dl:prev"})
-    nav_row.append(    {"text": f"{idx+1}/{total}", "callback_data": "dl:noop"})
-    if idx < total - 1:
-        nav_row.append({"text": "Next →",   "callback_data": f"dl:next"})
+        nav_row.append({"text": "← Prev", "callback_data": "dl:prev"})
+    nav_row.append({"text": f"{idx+1}/{total}", "callback_data": "dl:noop"})
+    # Show Next on the last result when background search is active/done with more
+    show_next = idx < total - 1
+    if not show_next and bg_search_id:
+        with _bg_lock:
+            bg = _bg_searches.get(bg_search_id, {})
+        # Show Next if bg is still running OR if bg is done with more results than shown
+        if not bg.get("done") or len(bg.get("folders", [])) > total:
+            show_next = True
+    if show_next:
+        nav_row.append({"text": "Next →", "callback_data": "dl:next"})
     action_row = [
         {"text": "⬇️ Download", "callback_data": "dl:download"},
         {"text": "❌ Cancel",   "callback_data": "dl:cancel"},
@@ -2229,30 +2377,32 @@ def _show_result(chat_id: int, session: dict):
     results  = session.get("results", [])
     text     = _result_text(session, idx)
     total    = len(results)
-    source   = results[idx].get("source", "slskd") if results else "slskd"
-    kb       = _result_keyboard(idx, total, source)
+    source        = results[idx].get("source", "slskd") if results else "slskd"
+    bg_search_id  = session.get("bg_search_id")
+    kb            = _result_keyboard(idx, total, source, bg_search_id=bg_search_id)
     meta     = session.get("meta", {})
-    msg_id   = session.get("result_msg_id")
-    msg_type = session.get("result_msg_type", "text")  # "photo" or "text"
+    msg_id, msg_type = _result_msgs.get(chat_id, (None, "text"))
     # Artwork: meta first, then YouTube thumbnail as fallback for yt results
     artwork  = meta.get("artwork_url", "")
     if not artwork and source == "yt" and results:
         artwork = results[idx].get("thumbnail", "")
 
     def _save_msg(new_id: int, mtype: str):
-        session["result_msg_id"]   = new_id
-        session["result_msg_type"] = mtype
-        _sess_set(chat_id, session)
+        _result_msgs[chat_id] = (new_id, mtype)
 
     if msg_id:
         # Edit the existing message using the correct method for its type
         if msg_type == "photo":
-            _tg_call("editMessageCaption", chat_id=chat_id, message_id=msg_id,
-                     caption=text, parse_mode="Markdown", reply_markup=kb)
+            r = _tg_call("editMessageCaption", chat_id=chat_id, message_id=msg_id,
+                         caption=text, parse_mode="Markdown", reply_markup=kb)
         else:
-            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-                     text=text, parse_mode="Markdown", reply_markup=kb)
-        return
+            r = _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                         text=text, parse_mode="Markdown", reply_markup=kb)
+        if r.get("ok"):
+            return
+        # stale message_id — clear and fall through to send fresh
+        _result_msgs.pop(chat_id, None)
+        msg_id = None
 
     # No existing message — send fresh
     if artwork:
@@ -2487,6 +2637,10 @@ def handle_download_start(chat_id: int):
     tg_send(chat_id, "What do you want to download?", reply_markup=kb)
 
 
+_SEARCH_CANCEL_KB = json.dumps({"inline_keyboard": [[
+    {"text": "❌ Cancel", "callback_data": "dl:cancel"},
+]]})
+
 def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
     kind  = session.get("kind", "track")
     query = session.get("query", "")
@@ -2500,13 +2654,24 @@ def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
     meta_thread = threading.Thread(target=_meta_worker, daemon=True)
     meta_thread.start()
 
-    folders = _slskd_search_only(q)
+    bg_search_id, folders = _slskd_search_progressive(q)
 
     # Wait for metadata (should already be done; cap at 5s extra)
     meta_thread.join(timeout=5)
     meta = meta_box[0]
 
+    # Check if user cancelled while we were searching
+    if _sess_get(chat_id).get("step") != "searching":
+        if bg_search_id:
+            with _bg_lock:
+                _bg_searches.pop(bg_search_id, None)
+        return
+
     if not folders:
+        # Clean up bg entry if it was registered
+        if bg_search_id:
+            with _bg_lock:
+                _bg_searches.pop(bg_search_id, None)
         session["step"] = "no_results"
         _sess_set(chat_id, session)
         _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
@@ -2522,7 +2687,8 @@ def _do_slskd_search(chat_id: int, session: dict, msg_id: int):
     for f in folders:
         f["source"] = "slskd"
 
-    session.update({"step": "results", "results": folders[:10], "idx": 0, "meta": meta})
+    session.update({"step": "results", "results": folders, "idx": 0, "meta": meta,
+                    "bg_search_id": bg_search_id})
     _sess_set(chat_id, session)
 
     _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
@@ -2537,6 +2703,10 @@ def _do_yt_search(chat_id: int, session: dict, msg_id: int):
 
     items = _ytdl_search(q)
 
+    # Check if user cancelled while we were searching
+    if _sess_get(chat_id).get("step") != "searching":
+        return
+
     if not items:
         kb = json.dumps({"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "dl:cancel"}]]})
         _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
@@ -2547,6 +2717,10 @@ def _do_yt_search(chat_id: int, session: dict, msg_id: int):
     # Build result objects compatible with _result_text
     yt_results = [dict(r, source="yt") for r in items]
     meta = _fetch_meta(artist, query, kind)
+
+    # Check again after slow metadata fetch
+    if _sess_get(chat_id).get("step") != "searching":
+        return
 
     session.update({"step": "results", "results": yt_results,
                     "idx": 0, "meta": meta})
@@ -2593,8 +2767,50 @@ def handle_callback(cq: dict):
         return
 
     if data == "dl:next":
-        total = len(session.get("results", []))
-        session["idx"] = min(total - 1, session.get("idx", 0) + 1)
+        results      = session.get("results", [])
+        total        = len(results)
+        idx          = session.get("idx", 0)
+        bg_search_id = session.get("bg_search_id")
+
+        if idx >= total - 1 and bg_search_id:
+            # At last result — try to inject more from background
+            with _bg_lock:
+                bg = _bg_searches.get(bg_search_id, {})
+                bg_done    = bg.get("done", False)
+                bg_folders = bg.get("folders", [])
+
+            if not bg_done:
+                _tg_call("answerCallbackQuery", callback_query_id=cq_id,
+                         text="⏳ Still searching, try again shortly…", show_alert=False)
+                return
+
+            # Background done — append new results (skip duplicates by username+folder)
+            existing_keys = {(r["username"], r["folder"]) for r in results if r.get("source") == "slskd"}
+            new_folders   = [
+                dict(f, source="slskd") for f in bg_folders
+                if (f["username"], f["folder"]) not in existing_keys
+            ]
+            if new_folders:
+                results.extend(new_folders)
+                session["results"] = results
+                # Clean up bg state
+                with _bg_lock:
+                    _bg_searches.pop(bg_search_id, None)
+                session.pop("bg_search_id", None)
+                session["idx"] = idx + 1
+            else:
+                # No new results despite bg finishing
+                with _bg_lock:
+                    _bg_searches.pop(bg_search_id, None)
+                session.pop("bg_search_id", None)
+                _tg_call("answerCallbackQuery", callback_query_id=cq_id,
+                         text="No more results found.", show_alert=False)
+                _sess_set(chat_id, session)
+                _show_result(chat_id, session)
+                return
+        else:
+            session["idx"] = min(total - 1, idx + 1)
+
         _sess_set(chat_id, session)
         _show_result(chat_id, session)
         return
@@ -2605,7 +2821,7 @@ def handle_callback(cq: dict):
         if not results:
             return
         # Remove result keyboard
-        msg_id = session.get("result_msg_id")
+        msg_id = _result_msgs.get(chat_id, (None,))[0]
         if msg_id:
             _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
                      reply_markup=json.dumps({"inline_keyboard": []}))
@@ -2617,6 +2833,10 @@ def handle_callback(cq: dict):
         msg_id = cq.get("message", {}).get("message_id")
         if msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        bg_id = session.get("bg_search_id")
+        if bg_id:
+            with _bg_lock:
+                _bg_searches.pop(bg_id, None)
         _sess_set(chat_id, {})
         tg_send(chat_id, "Cancelled.", reply_markup=TG_KEYBOARD)
         return
@@ -2627,10 +2847,15 @@ def handle_callback(cq: dict):
         q = (session.get("artist", "") + " " + session.get("query", "")).strip()
         if old_msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
-        session.pop("result_msg_id", None)
-        session.pop("result_msg_type", None)
+        bg_id = session.pop("bg_search_id", None)
+        if bg_id:
+            with _bg_lock:
+                _bg_searches.pop(bg_id, None)
+        _result_msgs.pop(chat_id, None)
+        session["step"] = "searching"
         _sess_set(chat_id, session)
-        res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{_esc(q)}*…")
+        res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{_esc(q)}*…",
+                         reply_markup=_SEARCH_CANCEL_KB)
         new_id = res.get("result", {}).get("message_id")
         threading.Thread(target=_do_slskd_search,
                          args=(chat_id, session, new_id), daemon=True).start()
@@ -2642,10 +2867,15 @@ def handle_callback(cq: dict):
         q = (session.get("artist", "") + " " + session.get("query", "")).strip()
         if old_msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
-        session.pop("result_msg_id", None)
-        session.pop("result_msg_type", None)
+        bg_id = session.pop("bg_search_id", None)
+        if bg_id:
+            with _bg_lock:
+                _bg_searches.pop(bg_id, None)
+        _result_msgs.pop(chat_id, None)
+        session["step"] = "searching"
         _sess_set(chat_id, session)
-        res    = tg_send(chat_id, f"🔍 Searching YouTube for *{_esc(q)}*…")
+        res    = tg_send(chat_id, f"🔍 Searching YouTube for *{_esc(q)}*…",
+                         reply_markup=_SEARCH_CANCEL_KB)
         new_id = res.get("result", {}).get("message_id")
         threading.Thread(target=_do_yt_search,
                          args=(chat_id, session, new_id), daemon=True).start()
@@ -2659,7 +2889,8 @@ def handle_callback(cq: dict):
         if msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
         # Send fresh searching message and kick off YouTube search
-        res    = tg_send(chat_id, f"🔍 Searching YouTube for *{q}*…")
+        res    = tg_send(chat_id, f"🔍 Searching YouTube for *{q}*…",
+                         reply_markup=_SEARCH_CANCEL_KB)
         new_id = res.get("result", {}).get("message_id")
         session["step"] = "searching"
         _sess_set(chat_id, session)
@@ -2721,7 +2952,8 @@ def handle_tg(chat_id, text):
                         "step": "searching"})
         _sess_set(chat_id, session)
         q = (artist.strip() + " " + rest.strip()).strip()
-        res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{q}*…")
+        res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{q}*…",
+                         reply_markup=_SEARCH_CANCEL_KB)
         msg_id = res.get("result", {}).get("message_id")
         threading.Thread(target=_do_slskd_search,
                          args=(chat_id, session, msg_id), daemon=True).start()
@@ -2775,6 +3007,8 @@ if __name__ == "__main__":
     _load_history()
     _load_seen()
     _load_discover()
+    # slskd ≥0.25 validates (not creates) its incomplete dir at startup — ensure it exists
+    Path("/media/sdb/Musics/Soulseek/.incomplete").mkdir(parents=True, exist_ok=True)
     threading.Thread(target=telegram_loop, daemon=True).start()
     threading.Thread(target=watcher_loop,  daemon=True).start()
     app.run(host="0.0.0.0", port=8888, debug=False)

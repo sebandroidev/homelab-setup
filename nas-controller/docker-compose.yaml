@@ -28,3 +28,6 @@ services:
       - /DATA/homelab-setup:/DATA/homelab-setup
       - /DATA/.ssh:/DATA/.ssh:ro
       - ./data:/data
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1

@@ -13,7 +13,12 @@ import:
   log: /config/import.log
   autotag: yes
 
+pluginpath:
+  - /config/plugins
+
 plugins:
+  - deezer_art
+  - deezer_meta
   - fetchart
   - embedart
   - lastgenre
@@ -30,6 +35,7 @@ fetchart:
     - filesystem
     - coverart
     - itunes
+    - deezer
     - amazon
     - albumart
     - wikipedia
