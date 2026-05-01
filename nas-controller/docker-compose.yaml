@@ -51,6 +51,7 @@ services:
       - /DATA/AppData/nas-controller:/DATA/AppData/nas-controller
       - /DATA/AppData/beets:/DATA/AppData/beets
       - /DATA/AppData/navidrome:/DATA/AppData/navidrome
+      - /usr/bin/docker:/usr/bin/docker:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     dns:
