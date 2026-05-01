@@ -16,7 +16,6 @@ services:
       - SLSKD_URL=http://host.docker.internal:5030
       - SLSKD_API_KEY=cff949683de044ba885fa83b1d01b5d07eca5fd47f00afd4
       - LASTFM_API_KEY=${LASTFM_API_KEY:-}
-      - DEPLOY_SECRET=${DEPLOY_SECRET:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -28,6 +27,28 @@ services:
       - /DATA/homelab-setup:/DATA/homelab-setup
       - /DATA/.ssh:/DATA/.ssh:ro
       - ./data:/data
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
+  deploy-agent:
+    build:
+      context: /DATA/AppData/nas-controller/deploy
+      dockerfile: Dockerfile
+    image: deploy-agent:latest
+    container_name: deploy-agent
+    restart: unless-stopped
+    ports:
+      - "8889:8889"
+    environment:
+      - DEPLOY_SECRET=${DEPLOY_SECRET:-}
+    volumes:
+      - /DATA/homelab-setup:/DATA/homelab-setup
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /DATA/.ssh:/DATA/.ssh:ro
+      - /DATA/AppData/nas-controller/deploy:/deploy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     dns:
       - 8.8.8.8
       - 1.1.1.1
