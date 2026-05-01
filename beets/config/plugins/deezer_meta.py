@@ -26,20 +26,39 @@ _PROMO_RE = [
     re.compile(r'\s*\(\s*Extended\s*Mix\s*\)\s*', re.I),
     re.compile(r'\s*\(\s*Instrumental\s*\)\s*', re.I),
     re.compile(r'\s*\[\s*Explicit\s*\]\s*', re.I),
+    # YouTube video title suffixes
+    re.compile(r'\s*[\(\[]\s*Official\s+Music\s+Video\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*Official\s+Video\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*Official\s+Audio\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*Lyrics?\s+Video\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*Lyrics?\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*(?:HD|HQ|4K)\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*Audio\s*[\)\]]\s*', re.I),
+    re.compile(r'\s*[\(\[]\s*Visualizer\s*[\)\]]\s*', re.I),
 ]
 
 _COLLAB_RE = re.compile(
     r'\s+(ft\.?|feat\.?|featuring|x\s+|vs\.?)\s+.*$', re.I)
 
+_ARTIST_PREFIX_RE = re.compile(r'^(.+?)\s+-\s+', re.I)
+
 
 def _clean_promo(title):
     for pat in _PROMO_RE:
-        title = pat.sub('', title).strip()
-    return title
+        title = pat.sub(' ', title)
+    return ' '.join(title.split())
 
 
 def _main_artist(artist):
     return _COLLAB_RE.sub('', artist).strip()
+
+
+def _strip_artist_prefix(title, artist):
+    """Remove 'Artist - ' prefix that yt-dlp bakes into video titles."""
+    for art in [artist, _main_artist(artist)]:
+        if art and title.lower().startswith(art.lower() + ' - '):
+            return title[len(art) + 3:].strip()
+    return title
 
 
 def _http(url):
@@ -49,14 +68,19 @@ def _http(url):
 
 
 def _deezer_search(artist, title):
-    """Progressive search: full artist → main artist → title only."""
+    """Progressive search: full artist → main artist → strip feat from title → title only."""
     main = _main_artist(artist)
+    core = _COLLAB_RE.sub('', title).strip()  # strip feat/ft from title for search
     attempts = []
     if artist:
         attempts.append('artist:"{}" track:"{}"'.format(artist, title))
     if main and main.lower() != artist.lower():
         attempts.append('artist:"{}" track:"{}"'.format(main, title))
+    if core and core.lower() != title.lower():
+        attempts.append('artist:"{}" track:"{}"'.format(main or artist, core))
     attempts.append('track:"{}"'.format(title))
+    if core and core.lower() != title.lower():
+        attempts.append('track:"{}"'.format(core))
 
     for q in attempts:
         url = _API + "/search?" + urllib.parse.urlencode({"q": q, "limit": 5})
@@ -85,18 +109,29 @@ def _apply_deezer(item, log):
     """Look up item on Deezer and fill missing fields. Returns True if changed."""
     artist    = _safe(item, "artist") or _safe(item, "albumartist")
     raw_title = _safe(item, "title")
-    clean_title = _clean_promo(raw_title)
+    clean_title = _strip_artist_prefix(_clean_promo(raw_title), artist)
 
     if not clean_title:
         return False
 
+    changed = False
+
+    # Normalize yt-dlp YYYYMMDD upload dates stored as year
+    cur_year = _safe(item, "year", 0)
+    if isinstance(cur_year, int) and cur_year > 9999:
+        item.year = cur_year // 10000
+        log.info("deezerfix: year {} -> {}", cur_year, item.year)
+        changed = True
+
     track = _deezer_search(artist, clean_title)
     if not track:
         log.info("deezerfix: {} - {}: not found on Deezer", artist, clean_title)
-        return False
+        if changed:
+            item.try_write()
+            item.store()
+        return changed
 
     album_data = _deezer_album(track["album"]["id"])
-    changed = False
 
     # Clean title
     if clean_title != raw_title:
