@@ -140,6 +140,7 @@ _sess_lock = threading.Lock()
 
 # Telegram result message IDs — ephemeral, not persisted to Redis
 _result_msgs: dict = {}  # chat_id -> (msg_id, msg_type)
+_pending_pipeline: dict = {}  # "artist - title" -> dl_id, for watcher→download linkage
 
 # Background slskd searches: search_id -> {"done": bool, "folders": list}
 _bg_searches: dict = {}
@@ -365,9 +366,37 @@ def _run_watch_pipeline(dir_path, files):
         t0        = time.time()
         log.info("Watcher pipeline: %s (%d files), last=%s, batch=%s", short, count, is_last, is_batch)
 
+        # Link to active download if artist/title appears in the detected dir path
+        watcher_dl_id = None
+        with _dl_lock:
+            short_lower = short.lower()
+            for _key, _did in list(_pending_pipeline.items()):
+                if _key and _key in short_lower:
+                    watcher_dl_id = _did
+                    del _pending_pipeline[_key]
+                    break
+
+        def _wpipe_log(msg):
+            if watcher_dl_id:
+                _dl_log(watcher_dl_id, msg)
+            log.info("[pipeline] %s", msg)
+
+        def _wpipe_notify(msg, force=False):
+            if not watcher_dl_id:
+                _notify_tg(msg, force=force)
+
+        def _wpipe_stage(stage):
+            if watcher_dl_id:
+                with _dl_lock:
+                    _downloads[watcher_dl_id]["progress"] = {"pct": 100, "stage": stage}
+
         # In batch mode, suppress noisy per-dir start messages
         if not is_batch:
-            _notify_tg(f"🔔 *New music detected!*\n📁 `{short}` ({count} track{'s' if count!=1 else ''})\n▶️ Running beets import…")
+            if watcher_dl_id:
+                _wpipe_stage("importing")
+                _wpipe_log(f"Beets import starting: {short}")
+            else:
+                _notify_tg(f"🔔 *New music detected!*\n📁 `{short}` ({count} track{'s' if count!=1 else ''})\n▶️ Running beets import…")
 
         def _log_proc(label: str, r):
             for line in (r.stdout + r.stderr).splitlines():
@@ -397,7 +426,9 @@ def _run_watch_pipeline(dir_path, files):
             _refresh_all_watch_dirs()
             # Lyrics also run once at the end
             if not is_batch:
-                _notify_tg("▶️ Running lyrics fetch…")
+                _wpipe_stage("lyrics")
+                _wpipe_log("Lyrics fetch starting…")
+                _wpipe_notify("▶️ Running lyrics fetch…")
             r2 = subprocess.run("python3 /DATA/AppData/beets/all-lyrics.py",
                 shell=True, capture_output=True, text=True, timeout=3600)
             _log_proc("lyrics", r2)
@@ -446,7 +477,19 @@ def _run_watch_pipeline(dir_path, files):
                     lines.append(f"• {lyrics_summary}")
                 _notify_tg("\n".join(lines), force=True)
         else:
-            _notify_tg(f"{icon} *{short}* done in {elapsed}s\n• {count} track{'s' if count!=1 else ''}\n• {lyrics_summary}", force=True)
+            if watcher_dl_id:
+                summary = f"✅ {count} track{'s' if count!=1 else ''} in {elapsed}s"
+                if lyrics_summary:
+                    summary += f" • {lyrics_summary}"
+                with _dl_lock:
+                    _downloads[watcher_dl_id].update({
+                        "status": "done" if ok else "error",
+                        "finished": datetime.now().isoformat(timespec="seconds"),
+                        "progress": {"pct": 100, "stage": "done", "summary": summary},
+                    })
+                _dl_log(watcher_dl_id, summary)
+            else:
+                _notify_tg(f"{icon} *{short}* done in {elapsed}s\n• {count} track{'s' if count!=1 else ''}\n• {lyrics_summary}", force=True)
 
         with _watch_lock:
             _watch["recent"].insert(0, {"dir": short, "count": count, "elapsed": elapsed,
@@ -2529,7 +2572,7 @@ def _progress_text(dl_id: str) -> str:
         eta_secs   = progress.get("eta_secs")
         n_done     = progress.get("n_done")
         total_files= progress.get("total_files")
-        stage_map  = {"importing": "📥 Importing…", "art": "🎨 Fetching art…"}
+        stage_map  = {"importing": "📥 Importing…", "art": "🎨 Fetching art…", "lyrics": "🎵 Fetching lyrics…", "done": "✅ Library updated"}
         if stage in stage_map:
             text += f"{stage_map[stage]}\n"
             text += f"`{'▓' * 18}` 100%\n"
@@ -2546,12 +2589,15 @@ def _progress_text(dl_id: str) -> str:
                 text += "`" + "  ".join(parts) + "`\n"
             if n_done is not None and total_files:
                 text += f"Files: {n_done}/{total_files}\n"
-    elif progress and status == "done":
-        stage = progress.get("stage", "")
-        last = [l for l in lines[-2:] if l.strip()]
-        text += f"`{'▓' * 18}` 100%\n"
-        if last:
-            text += "```\n" + "\n".join(last) + "\n```"
+    elif status in ("done", "error"):
+        text += f"`{'▓' * 18}` 100%\n" if status == "done" else ""
+        summary = (progress or {}).get("summary")
+        if summary:
+            text += f"`{summary}`\n"
+        else:
+            last = [l for l in lines[-2:] if l.strip()]
+            if last:
+                text += "```\n" + "\n".join(last) + "\n```"
     elif status == "searching":
         last = [l for l in lines[-2:] if l.strip()]
         if last:
@@ -2591,6 +2637,10 @@ def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
         with _dl_lock:
             status = _downloads.get(dl_id, {}).get("status", "error")
         if status in terminal:
+            # One final edit to show done state
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=_progress_text(dl_id), parse_mode="Markdown",
+                     reply_markup=_progress_keyboard(dl_id))
             break
 
 def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
@@ -2692,12 +2742,26 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
 
         if n_done + n_error >= total or (not states and ever_seen):
             ok = n_error == 0
-            with _dl_lock:
-                _downloads[dl_id].update({
-                    "status": "done" if ok else "error",
-                    "finished": datetime.now().isoformat(timespec="seconds"),
-                })
-            _dl_log(dl_id, "Done!" if ok else f"{n_error}/{total} files failed")
+            if ok:
+                with _dl_lock:
+                    _downloads[dl_id].update({
+                        "status": "importing",
+                        "progress": {"pct": 100, "stage": "importing"},
+                    })
+                    track = _downloads[dl_id].get("track", {})
+                    artist = track.get("artist", "")
+                    title  = track.get("title", "")
+                    key = f"{artist} - {title}".lower().strip()
+                    if key:
+                        _pending_pipeline[key] = dl_id
+                _dl_log(dl_id, "Download complete — waiting for beets import…")
+            else:
+                with _dl_lock:
+                    _downloads[dl_id].update({
+                        "status": "error",
+                        "finished": datetime.now().isoformat(timespec="seconds"),
+                    })
+                _dl_log(dl_id, f"{n_error}/{total} files failed")
             return
 
     _dl_log(dl_id, "ERROR: Timed out")
