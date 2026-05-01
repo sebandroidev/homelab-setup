@@ -2756,6 +2756,21 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
         n_error = len(confirmed_fail)
         avg_pct = (sum(f.get("percentComplete", 0) for f in states.values()) / len(states)
                    if states else 100)
+        tot_bytes  = sum(int(f.get("size", 0)) for f in states.values())
+        done_bytes = sum(int(f.get("bytesTransferred", 0)) for f in states.values())
+        avg_speed  = sum(float(f.get("averageSpeed", 0)) for f in states.values())
+        eta_s = int((tot_bytes - done_bytes) / avg_speed) if avg_speed > 1 else None
+        with _dl_lock:
+            _downloads[dl_id]["progress"] = {
+                "pct": avg_pct,
+                "downloaded": done_bytes,
+                "total": tot_bytes or None,
+                "speed_bps": avg_speed,
+                "eta_secs": eta_s,
+                "stage": "downloading",
+                "n_done": n_done,
+                "total_files": total,
+            }
         _dl_log(dl_id, f"{n_done}/{total} done, {n_error} errors — {avg_pct:.0f}% avg")
 
         if n_done + n_error >= total or (not states and ever_seen):
