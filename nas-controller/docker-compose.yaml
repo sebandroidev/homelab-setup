@@ -16,6 +16,7 @@ services:
       - SLSKD_URL=http://host.docker.internal:5030
       - SLSKD_API_KEY=cff949683de044ba885fa83b1d01b5d07eca5fd47f00afd4
       - LASTFM_API_KEY=${LASTFM_API_KEY:-}
+      - GENIUS_ACCESS_TOKEN=zwAAVFHM75M1GlOtx1WCcYpfRSQMlx6G7xT0coylZsFwsppx-H1LC6p4vuStzOw8
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

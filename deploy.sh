@@ -21,6 +21,6 @@ echo "[deploy] Syncing navidrome config..."
 cp navidrome/navidrome.toml /DATA/AppData/navidrome/data/navidrome.toml
 
 echo "[deploy] Restarting containers..."
-docker restart nas-controller
+docker restart --time 0 nas-controller
 
 echo "[deploy] Done."

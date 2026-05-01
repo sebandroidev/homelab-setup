@@ -146,6 +146,9 @@ _pending_pipeline: dict = {}  # "artist - title" -> dl_id, for watcher→downloa
 _bg_searches: dict = {}
 _bg_lock = threading.Lock()
 
+# Background lyrics scan lock — prevents concurrent full-library scans
+_lyrics_bg_lock = threading.Lock()
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 def _load_history():
     global _history
@@ -321,15 +324,20 @@ def _scan_new_files():
     for watch_dir in WATCH_DIRS:
         if not os.path.isdir(watch_dir): continue
         for root, dirs, files in os.walk(watch_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]  # skip .incomplete and hidden dirs
             dirs.sort()
             for fname in sorted(files):
                 if os.path.splitext(fname)[1].lower() not in AUDIO_EXTS: continue
                 fpath = os.path.join(root, fname)
                 try: mtime = os.path.getmtime(fpath)
                 except OSError: continue
-                if _seen_files.get(fpath) != mtime:
+                if fpath not in _seen_files:
+                    # Truly new file — record and trigger
                     _seen_files[fpath] = mtime
                     new_by_dir.setdefault(root, []).append(fpath)
+                elif _seen_files[fpath] != mtime:
+                    # File was modified (e.g. embedart changed mtime) — just update, don't re-trigger
+                    _seen_files[fpath] = mtime
     if new_by_dir: _save_seen()
     return new_by_dir
 
@@ -348,6 +356,24 @@ def _refresh_all_watch_dirs():
                 except OSError:
                     pass
     _save_seen()
+
+def _run_lyrics_background():
+    """Full-library lyrics scan running as a background daemon after the priority phase."""
+    if not _lyrics_bg_lock.acquire(blocking=False):
+        log.info("Background lyrics scan already running — skipping")
+        return
+    try:
+        log.info("Background lyrics scan starting…")
+        r = subprocess.run(
+            "python3 /DATA/AppData/beets/all-lyrics.py",
+            shell=True, capture_output=True, text=True, timeout=7200)
+        summary = next(
+            (l.strip() for l in (r.stdout + r.stderr).splitlines() if "Done:" in l), "")
+        log.info("Background lyrics scan done: %s", summary)
+    except Exception as e:
+        log.warning("Background lyrics scan error: %s", e)
+    finally:
+        _lyrics_bg_lock.release()
 
 def _run_watch_pipeline(dir_path, files):
     global _pipeline_waiting
@@ -371,7 +397,11 @@ def _run_watch_pipeline(dir_path, files):
         with _dl_lock:
             short_lower = short.lower()
             for _key, _did in list(_pending_pipeline.items()):
-                if _key and _key in short_lower:
+                if not _key:
+                    continue
+                # Match full key or individual artist/title tokens (album folder may not contain track title)
+                _tokens = [_key] + [t.strip() for t in _key.split(" - ") if len(t.strip()) > 2]
+                if any(tok in short_lower for tok in _tokens):
                     watcher_dl_id = _did
                     del _pending_pipeline[_key]
                     break
@@ -412,25 +442,44 @@ def _run_watch_pipeline(dir_path, files):
 
         lyrics_summary = ""
         if is_last:
+            # Snapshot existing paths before global ops — used to detect organize destinations
+            seen_before_global_ops = set(_seen_files.keys())
             # fetchart + embedart run on whole library — do once after all imports
             r_art = subprocess.run(
                 'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
                 shell=True, capture_output=True, text=True, timeout=1800)
             _log_proc("art", r_art)
+            # Pre-register embedart-modified files so the watcher doesn't re-detect them
+            _refresh_all_watch_dirs()
             # Organize: move Soulseek downloads into library structure
             r_org = subprocess.run(
                 'docker exec beets python3 /config/beet-organize.py',
                 shell=True, capture_output=True, text=True, timeout=1800)
             _log_proc("organize", r_org)
-            # Refresh ALL dirs: fetchart/embedart/organize modify files across the whole library
+            # Pre-register organized files (new paths) before next watcher scan
             _refresh_all_watch_dirs()
-            # Lyrics also run once at the end
+            # Fresh dirs = directories of paths that didn't exist before global ops.
+            # embedart only modifies existing files; organize MOVES files to new paths.
+            # So new paths in _seen_files are exactly the organize destinations.
+            fresh_dirs = set()
+            for _fp in _seen_files:
+                if _fp not in seen_before_global_ops:
+                    fresh_dirs.add(os.path.dirname(_fp))
+            if not fresh_dirs:
+                fresh_dirs.add(dir_path)  # fallback: original detected dir
+            # Lyrics also run once at the end, scoped to fresh dirs only
             if not is_batch:
                 _wpipe_stage("lyrics")
                 _wpipe_log("Lyrics fetch starting…")
                 _wpipe_notify("▶️ Running lyrics fetch…")
-            r2 = subprocess.run("python3 /DATA/AppData/beets/all-lyrics.py",
-                shell=True, capture_output=True, text=True, timeout=3600)
+            # Phase 1 — priority: fetch lyrics only for newly imported/organized tracks
+            if fresh_dirs:
+                dirs_arg = " ".join(f'"{d}"' for d in sorted(fresh_dirs))
+                lyrics_cmd = f"python3 /DATA/AppData/beets/all-lyrics.py --dirs {dirs_arg}"
+            else:
+                lyrics_cmd = "python3 /DATA/AppData/beets/all-lyrics.py"
+            r2 = subprocess.run(lyrics_cmd,
+                shell=True, capture_output=True, text=True, timeout=1800)
             _log_proc("lyrics", r2)
             # Fallback: if script logged to file instead of stdout, read the summary line
             lyrics_summary = next(
@@ -449,6 +498,8 @@ def _run_watch_pipeline(dir_path, files):
                 log.info("Navidrome rescan triggered")
             except Exception as _e:
                 log.warning("Navidrome rescan failed: %s", _e)
+            # Phase 2 — background: scan full library for any other missing lyrics (non-blocking)
+            threading.Thread(target=_run_lyrics_background, daemon=True).start()
         else:
             # More pipelines queued — skip global tasks, just note it
             lyrics_summary = "art+lyrics after remaining imports"
@@ -2639,9 +2690,10 @@ def _progress_keyboard(dl_id: str) -> str:
 
 def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
     """Background thread: edit progress message every 2s until terminal state."""
-    terminal  = {"done", "error"}
-    last_text = ""
-    last_kb   = ""
+    terminal        = {"done", "error"}
+    last_text       = ""
+    last_kb         = ""
+    importing_since = None
     while True:
         time.sleep(2)
         text = _progress_text(dl_id)
@@ -2653,6 +2705,19 @@ def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
             last_kb   = kb
         with _dl_lock:
             status = _downloads.get(dl_id, {}).get("status", "error")
+        # Safety timeout: if watcher never links back, force done after 15 min
+        if status in ("importing", "lyrics", "art"):
+            if importing_since is None:
+                importing_since = time.time()
+            elif time.time() - importing_since > 900:
+                with _dl_lock:
+                    _downloads[dl_id]["status"] = "done"
+                    if not (_downloads[dl_id].get("progress") or {}).get("summary"):
+                        _downloads[dl_id]["progress"] = {"pct": 100, "stage": "done",
+                                                          "summary": "✅ Pipeline completed"}
+                status = "done"
+        else:
+            importing_since = None
         if status in terminal:
             final_text = _progress_text(dl_id)
             final_kb   = _progress_keyboard(dl_id)
