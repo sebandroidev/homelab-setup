@@ -2622,10 +2622,17 @@ def _progress_keyboard(dl_id: str) -> str:
             {"text": "⏸ Pause",    "callback_data": f"dl:pause:{dl_id}"},
             {"text": "❌ Cancel",  "callback_data": f"dl:abort:{dl_id}"},
         ])
+    elif status in ("importing", "lyrics", "art"):
+        rows.append([{"text": "❌ Cancel", "callback_data": f"dl:abort:{dl_id}"}])
     elif status == "paused":
         rows.append([
             {"text": "▶️ Resume",  "callback_data": f"dl:resume:{dl_id}"},
             {"text": "❌ Cancel",  "callback_data": f"dl:abort:{dl_id}"},
+        ])
+    elif status == "error":
+        rows.append([
+            {"text": "🔁 Retry Soulseek", "callback_data": "dl:retry_slskd"},
+            {"text": "▶️ YouTube",         "callback_data": "dl:retry_yt"},
         ])
     rows.append([{"text": "🗑 Clear", "callback_data": f"dl:clear:{dl_id}"}])
     return json.dumps({"inline_keyboard": rows})
