@@ -559,6 +559,54 @@ def _slskd(method: str, path: str, body=None):
     except Exception as e:
         return {"_error": str(e)}
 
+
+_YTDL_PROGRESS_RE = re.compile(
+    r'\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+)(\S+)\s+at\s+([\d.]+)(\S+)(?:\s+ETA\s+(\d+:\d+))?'
+)
+
+def _bar(pct: float, width: int = 18) -> str:
+    filled = round(pct / 100 * width)
+    return "▓" * filled + "░" * (width - filled)
+
+def _fmt_size(b) -> str:
+    if b is None: return "?"
+    b = int(b)
+    if b >= 1_048_576: return f"{b/1_048_576:.1f}MiB"
+    if b >= 1024:      return f"{b/1024:.0f}KiB"
+    return f"{b}B"
+
+def _fmt_speed(bps) -> str:
+    if not bps: return ""
+    bps = float(bps)
+    if bps >= 1_048_576: return f"{bps/1_048_576:.1f}MiB/s"
+    if bps >= 1024:      return f"{bps/1024:.0f}KiB/s"
+    return f"{bps:.0f}B/s"
+
+def _fmt_eta(secs) -> str:
+    if secs is None or secs < 0: return ""
+    secs = int(secs)
+    if secs >= 3600: return f"{secs//3600}h{(secs%3600)//60:02d}m"
+    if secs >= 60:   return f"{secs//60}m{secs%60:02d}s"
+    return f"{secs}s"
+
+def _parse_ytdl_size(val, unit) -> int:
+    val = float(val)
+    unit = unit.strip().upper()
+    if unit == "GIB": return int(val * 1_073_741_824)
+    if unit == "MIB": return int(val * 1_048_576)
+    if unit == "KIB": return int(val * 1024)
+    return int(val)
+
+def _parse_ytdl_speed(val, unit) -> float:
+    return _parse_ytdl_size(val, unit.replace("/s", "").replace("/S", "")) / 1.0
+
+def _parse_ytdl_eta(s) -> int:
+    if not s: return 0
+    parts = s.split(":")
+    if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
+    if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+    return 0
+
 def _dl_log(dl_id: str, msg: str):
     with _dl_lock:
         _downloads[dl_id]["output"].append(msg)
@@ -772,6 +820,21 @@ def _download_worker(dl_id: str, track: dict):
         n_error = len(confirmed_fail)
         avg_pct = (sum(f.get("percentComplete", 0) for f in states.values()) / len(states)
                    if states else 100)
+        tot_bytes  = sum(int(f.get("size", 0)) for f in states.values())
+        done_bytes = sum(int(f.get("bytesTransferred", 0)) for f in states.values())
+        avg_speed  = sum(float(f.get("averageSpeed", 0)) for f in states.values())
+        eta_s = int((tot_bytes - done_bytes) / avg_speed) if avg_speed > 1 else None
+        with _dl_lock:
+            _downloads[dl_id]["progress"] = {
+                "pct": avg_pct,
+                "downloaded": done_bytes,
+                "total": tot_bytes or None,
+                "speed_bps": avg_speed,
+                "eta_secs": eta_s,
+                "stage": "downloading",
+                "n_done": n_done,
+                "total_files": total,
+            }
         _dl_log(dl_id, f"{n_done}/{total} done, {n_error} errors — {avg_pct:.0f}% avg")
 
         if n_done + n_error >= total or (not states and ever_seen):
@@ -2243,7 +2306,24 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
         import subprocess as sp
         proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
         for line in proc.stdout:
-            _dl_log(dl_id, line.rstrip())
+            stripped = line.rstrip()
+            _dl_log(dl_id, stripped)
+            m = _YTDL_PROGRESS_RE.search(stripped)
+            if m:
+                pct_v, sz_v, sz_u, spd_v, spd_u, eta_s = m.groups()
+                pct_f  = float(pct_v)
+                tot    = _parse_ytdl_size(sz_v, sz_u)
+                spd    = _parse_ytdl_speed(spd_v, spd_u)
+                eta    = _parse_ytdl_eta(eta_s)
+                with _dl_lock:
+                    _downloads[dl_id]["progress"] = {
+                        "pct": pct_f,
+                        "downloaded": int(pct_f / 100 * tot),
+                        "total": tot,
+                        "speed_bps": spd,
+                        "eta_secs": eta,
+                        "stage": "downloading",
+                    }
         proc.wait()
         ok = proc.returncode == 0
         if ok and meta:
@@ -2265,6 +2345,8 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
                     # Force beet re-import with clean tags (bypass incremental,
                     # in case watcher already ran 'asis' before inject completed)
                     beets_dir = _beets_path(out_dir)
+                    with _dl_lock:
+                        _downloads[dl_id]["progress"] = {"pct": 100, "stage": "importing"}
                     _dl_log(dl_id, f"Re-importing via beets: {beets_dir}")
                     r_imp = sp.run(
                         f'docker exec beets beet import --noincremental -q "{beets_dir}"',
@@ -2274,6 +2356,8 @@ def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
                             _dl_log(dl_id, f"[beets] {line.strip()}")
                             log.info("[beets:yt-import] %s", line.strip())
                     # Refresh cover art for newly imported item
+                    with _dl_lock:
+                        _downloads[dl_id]["progress"] = {"pct": 100, "stage": "art"}
                     _dl_log(dl_id, "Fetching cover art…")
                     r_art = sp.run(
                         "docker exec beets beet fetchart ; docker exec beets beet embedart -y",
@@ -2423,15 +2507,58 @@ def _show_result(chat_id: int, session: dict):
 def _progress_text(dl_id: str) -> str:
     with _dl_lock:
         d = _downloads.get(dl_id, {})
-    status = d.get("status", "queued")
-    lines  = d.get("output", [])
-    last   = [l for l in lines[-6:] if l.strip()]
-    icons  = {"queued": "⏳", "searching": "🔍", "downloading": "⬇️",
-               "done": "✅", "error": "❌", "paused": "⏸", "stalled": "🕐"}
+    status   = d.get("status", "queued")
+    progress = d.get("progress")
+    track    = d.get("track", {})
+    lines    = d.get("output", [])
+    icons = {"queued": "⏳", "searching": "🔍", "downloading": "⬇️",
+             "done": "✅", "error": "❌", "paused": "⏸", "stalled": "🕐"}
     icon   = icons.get(status, "⏳")
-    text   = f"{icon} *Download* — {status}\n"
-    if last:
-        text += "```\n" + "\n".join(last) + "\n```"
+    artist = track.get("artist", "")
+    title  = track.get("title", "")
+    label  = f"*{artist}* — {title}" if (artist or title) else "*Download*"
+    text   = f"{icon} {label}\n"
+
+    if progress and status == "downloading":
+        pct        = progress.get("pct", 0)
+        stage      = progress.get("stage", "downloading")
+        speed_bps  = progress.get("speed_bps", 0)
+        downloaded = progress.get("downloaded", 0)
+        total      = progress.get("total")
+        eta_secs   = progress.get("eta_secs")
+        n_done     = progress.get("n_done")
+        total_files= progress.get("total_files")
+        stage_map  = {"importing": "📥 Importing…", "art": "🎨 Fetching art…"}
+        if stage in stage_map:
+            text += f"{stage_map[stage]}\n"
+            text += f"`{'▓' * 18}` 100%\n"
+        else:
+            text += f"`{_bar(pct)}` {pct:.0f}%\n"
+            parts = []
+            if total:
+                parts.append(f"{_fmt_size(downloaded)} / {_fmt_size(total)}")
+            if speed_bps:
+                parts.append(f"⚡ {_fmt_speed(speed_bps)}")
+            if eta_secs:
+                parts.append(f"⏱ {_fmt_eta(eta_secs)}")
+            if parts:
+                text += "`" + "  ".join(parts) + "`\n"
+            if n_done is not None and total_files:
+                text += f"Files: {n_done}/{total_files}\n"
+    elif progress and status == "done":
+        stage = progress.get("stage", "")
+        last = [l for l in lines[-2:] if l.strip()]
+        text += f"`{'▓' * 18}` 100%\n"
+        if last:
+            text += "```\n" + "\n".join(last) + "\n```"
+    elif status == "searching":
+        last = [l for l in lines[-2:] if l.strip()]
+        if last:
+            text += "```\n" + "\n".join(last) + "\n```"
+    else:
+        last = [l for l in lines[-4:] if l.strip()]
+        if last:
+            text += "```\n" + "\n".join(last) + "\n```"
     return text
 
 def _progress_keyboard(dl_id: str) -> str:
@@ -2452,10 +2579,10 @@ def _progress_keyboard(dl_id: str) -> str:
     return json.dumps({"inline_keyboard": rows})
 
 def _monitor_download(chat_id: int, dl_id: str, msg_id: int):
-    """Background thread: edit progress message every 4s until terminal state."""
+    """Background thread: edit progress message every 2s until terminal state."""
     terminal = {"done", "error"}
     while True:
-        time.sleep(4)
+        time.sleep(2)
         text = _progress_text(dl_id)
         kb   = _progress_keyboard(dl_id)
         _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
