@@ -3335,6 +3335,10 @@ def handle_callback(cq: dict):
         dl_id  = parts[2]
         msg_id = cq.get("message", {}).get("message_id")
         with _dl_lock:
+            if dl_id not in _downloads:
+                if msg_id: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+                tg_send(chat_id, "⚠️ Download no longer tracked (bot was restarted). Tap *⬇️ Download Tracks* to start a new search.", reply_markup=TG_KEYBOARD)
+                return
             _downloads[dl_id]["stall_reset"] = True
         if msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
@@ -3347,13 +3351,17 @@ def handle_callback(cq: dict):
         dl_id  = parts[2]
         msg_id = cq.get("message", {}).get("message_id")
         with _dl_lock:
-            d = _downloads.get(dl_id, {})
+            if dl_id not in _downloads:
+                if msg_id: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+                tg_send(chat_id, "⚠️ Download no longer tracked (bot was restarted). Tap *⬇️ Download Tracks* to start a new search.", reply_markup=TG_KEYBOARD)
+                return
+            d = _downloads[dl_id]
             if action == "pause" and d.get("status") == "downloading":
-                _downloads[dl_id]["status"] = "paused"
+                d["status"] = "paused"
             elif action == "resume" and d.get("status") == "paused":
-                _downloads[dl_id]["status"] = "downloading"
+                d["status"] = "downloading"
             elif action == "abort":
-                _downloads[dl_id]["status"] = "error"
+                d["status"] = "error"
                 _dl_log(dl_id, "Cancelled by user.")
             elif action == "clear":
                 pass  # just remove the message
