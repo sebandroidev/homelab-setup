@@ -3058,10 +3058,11 @@ def _start_dl(chat_id: int, session: dict):
 
 def handle_download_start(chat_id: int):
     _sess_set(chat_id, {"step": "ask_kind"})
-    kb = _inline([[
-        {"text": "🎵 Track",  "callback_data": "dl:kind:track"},
-        {"text": "💿 Album",  "callback_data": "dl:kind:album"},
-    ]])
+    kb = _inline([
+        [{"text": "🎵 Track",  "callback_data": "dl:kind:track"},
+         {"text": "💿 Album",  "callback_data": "dl:kind:album"}],
+        [{"text": "❌ Cancel", "callback_data": "dl:cancel"}],
+    ])
     tg_send(chat_id, "What do you want to download?", reply_markup=kb)
 
 
