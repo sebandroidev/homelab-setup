@@ -3189,7 +3189,7 @@ def handle_callback(cq: dict):
         if msg_id:
             _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
                      reply_markup=json.dumps({"inline_keyboard": []}))
-        tg_send(chat_id, f"Enter *artist — {label} title*:", reply_markup=TG_KEYBOARD)
+        tg_send(chat_id, f"Enter *artist — {label} title*:", reply_markup=_SEARCH_CANCEL_KB)
         return
 
     # ── Pagination ────────────────────────────────────────────────────────────
