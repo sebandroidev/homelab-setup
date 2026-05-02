@@ -83,9 +83,13 @@ EXPOSED_SERVICES = [
 
 # ── Telegram keyboard ────────────────────────────────────────────────────────
 TG_KEYBOARD = json.dumps({
-    "keyboard": [[{"text": "⬇️ Download Tracks"}]],
+    "keyboard": [[{"text": "⬇️ Download Tracks"}, {"text": "📊 NAS Stats"}]],
     "resize_keyboard": True,
     "persistent": True,
+})
+
+_STATS_REFRESH_KB = json.dumps({
+    "inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "stats:refresh"}]]
 })
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -148,6 +152,138 @@ _bg_lock = threading.Lock()
 
 # Background lyrics scan lock — prevents concurrent full-library scans
 _lyrics_bg_lock = threading.Lock()
+
+# DNS watchdog state
+_dns_fail_since: float | None = None
+_DNS_RESTART_AFTER = 600  # restart container after 10 min of continuous DNS failure
+
+# ── NAS Stats ─────────────────────────────────────────────────────────────────
+def _collect_nas_stats() -> dict:
+    import glob as _glob
+    stats: dict = {}
+
+    try:
+        uptime_secs = float(open("/proc/uptime").read().split()[0])
+        h, rem = divmod(int(uptime_secs), 3600)
+        m = rem // 60
+        d, h = divmod(h, 24)
+        stats["uptime"] = (f"{d}d {h}h {m}m" if d else f"{h}h {m}m")
+    except Exception:
+        stats["uptime"] = "?"
+
+    try:
+        p = open("/proc/loadavg").read().split()
+        stats["load"] = f"{p[0]} · {p[1]} · {p[2]}"
+    except Exception:
+        stats["load"] = "?"
+
+    try:
+        mem: dict = {}
+        for line in open("/proc/meminfo"):
+            k, _, v = line.partition(":")
+            mem[k.strip()] = int(v.strip().split()[0])
+        total      = mem.get("MemTotal", 0)
+        avail      = mem.get("MemAvailable", 0)
+        used       = total - avail
+        swap_total = mem.get("SwapTotal", 0)
+        swap_used  = swap_total - mem.get("SwapFree", 0)
+        def _gib(kb): return f"{kb/1024/1024:.1f} GiB"
+        def _pct(u, t): return f"{u*100//t}%" if t else "?"
+        stats.update(mem_used=_gib(used), mem_total=_gib(total), mem_pct=_pct(used, total),
+                     swap_used=_gib(swap_used), swap_total=_gib(swap_total), swap_pct=_pct(swap_used, swap_total))
+    except Exception:
+        for k in ("mem_used", "mem_total", "mem_pct", "swap_used", "swap_total", "swap_pct"):
+            stats[k] = "?"
+
+    try:
+        r = subprocess.run(["df", "--output=used,avail,pcent", "/media/sdb"],
+                           capture_output=True, text=True, timeout=5)
+        _, data_line = r.stdout.strip().splitlines()
+        used_kb, avail_kb, pct = data_line.split()
+        def _gb(kb): return f"{int(kb)/1024/1024:.0f} GB"
+        stats.update(disk_used=_gb(used_kb), disk_total=_gb(int(used_kb)+int(avail_kb)), disk_pct=pct.strip())
+    except Exception:
+        stats.update(disk_used="?", disk_total="?", disk_pct="?")
+
+    try:
+        temps = []
+        for tf in sorted(_glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+            t = int(open(tf).read().strip()) // 1000
+            if t > 0:
+                temps.append(t)
+        if temps:
+            stats["temps"] = "  ".join(f"{t}°C" for t in temps)
+    except Exception:
+        pass
+
+    try:
+        r = subprocess.run(
+            ["/usr/bin/docker", "stats", "--no-stream",
+             "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"],
+            capture_output=True, text=True, timeout=12)
+        rows = []
+        for line in r.stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            name, cpu_str, mem_str = parts[0], parts[1], parts[2]
+            try:
+                cpu_val = float(cpu_str.rstrip("%")) if cpu_str not in ("--", "") else 0.0
+            except ValueError:
+                cpu_val = 0.0
+            mem_used = mem_str.split("/")[0].strip() if "/" in mem_str else mem_str.strip()
+            def _to_mib(s):
+                s = s.strip()
+                try:
+                    if s.endswith("GiB"): return float(s[:-3]) * 1024
+                    if s.endswith("MiB"): return float(s[:-3])
+                    if s.endswith("KiB"): return float(s[:-3]) / 1024
+                except ValueError:
+                    pass
+                return 0.0
+            if cpu_val >= 0.1 or _to_mib(mem_used) >= 10:
+                rows.append((cpu_val, name, cpu_str, mem_used))
+        rows.sort(reverse=True)
+        stats["containers"] = [(n, c, m) for _, n, c, m in rows[:7]]
+    except Exception as e:
+        stats["containers_err"] = str(e)
+
+    return stats
+
+def _nas_stats_text(stats: dict) -> str:
+    import datetime as _dt
+    now = _dt.datetime.now().strftime("%H:%M")
+    lines = [f"📊 *NAS Status* — {now} · up {stats.get('uptime', '?')}", ""]
+    lines += [
+        "💻 *System*",
+        f"  Load:   {stats.get('load', '?')}  _(1 / 5 / 15 min)_",
+        f"  Mem:    {stats.get('mem_used', '?')} / {stats.get('mem_total', '?')}  ({stats.get('mem_pct', '?')})",
+        f"  Swap:   {stats.get('swap_used', '?')} / {stats.get('swap_total', '?')}  ({stats.get('swap_pct', '?')})",
+    ]
+    if stats.get("temps"):
+        lines.append(f"  Temp:   {stats['temps']}")
+    lines += [
+        "",
+        "💾 *Storage*",
+        f"  Music:  {stats.get('disk_used', '?')} / {stats.get('disk_total', '?')}  ({stats.get('disk_pct', '?')})",
+        "",
+        "🐳 *Containers* _(top by CPU)_",
+    ]
+    if stats.get("containers"):
+        for name, cpu, mem in stats["containers"]:
+            lines.append(f"  `{name[:20]:<20}` {cpu:>7}  {mem}")
+    else:
+        lines.append("  ⚠️ stats unavailable" + (f": {stats['containers_err']}" if stats.get("containers_err") else ""))
+    return "\n".join(lines)
+
+def _send_nas_stats(chat_id: int, msg_id: int | None = None):
+    stats = _collect_nas_stats()
+    text  = _nas_stats_text(stats)
+    if msg_id:
+        _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                 text=text, parse_mode="Markdown", reply_markup=_STATS_REFRESH_KB)
+    else:
+        tg_send(chat_id, text, reply_markup=_STATS_REFRESH_KB)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 def _load_history():
@@ -3030,6 +3166,11 @@ def handle_callback(cq: dict):
         return
     _tg_call("answerCallbackQuery", callback_query_id=cq_id)
 
+    if data == "stats:refresh":
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_send_nas_stats, args=(chat_id, msg_id), daemon=True).start()
+        return
+
     session = _sess_get(chat_id)
     parts   = data.split(":")
 
@@ -3256,7 +3397,11 @@ def handle_tg(chat_id, text):
         handle_download_start(chat_id)
         return
 
-    tg_send(chat_id, "Tap *⬇️ Download Tracks* to get started.", reply_markup=TG_KEYBOARD)
+    if "stats" in t or "📊" in text:
+        threading.Thread(target=_send_nas_stats, args=(chat_id,), daemon=True).start()
+        return
+
+    tg_send(chat_id, "Tap *⬇️ Download Tracks* to search music or *📊 NAS Stats* for system info.", reply_markup=TG_KEYBOARD)
 
 def telegram_loop():
     if not BOT_TOKEN:
@@ -3293,6 +3438,32 @@ def telegram_loop():
         except Exception as e:
             log.error("Telegram poll: %s", e); time.sleep(5)
 
+# ── DNS watchdog ──────────────────────────────────────────────────────────────
+def _dns_watchdog():
+    """Check api.telegram.org reachability every 60s; restart container after 10 min outage."""
+    import socket as _socket
+    global _dns_fail_since
+    while True:
+        time.sleep(60)
+        try:
+            _socket.getaddrinfo("api.telegram.org", 443, timeout=5)
+            if _dns_fail_since is not None:
+                log.info("DNS watchdog: api.telegram.org reachable again — resetting timer")
+            _dns_fail_since = None
+        except Exception:
+            now = time.time()
+            if _dns_fail_since is None:
+                _dns_fail_since = now
+                log.warning("DNS watchdog: api.telegram.org unreachable — 10-min restart timer started")
+            else:
+                elapsed = now - _dns_fail_since
+                log.warning("DNS watchdog: still unreachable (%.0fs / %ds threshold)", elapsed, _DNS_RESTART_AFTER)
+                if elapsed >= _DNS_RESTART_AFTER:
+                    log.warning("DNS watchdog: threshold reached — restarting nas-controller container")
+                    subprocess.run(
+                        ["/usr/bin/docker", "restart", "--time", "0", "nas-controller"],
+                        capture_output=True, timeout=30)
+
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     _load_history()
@@ -3302,4 +3473,5 @@ if __name__ == "__main__":
     Path("/media/sdb/Musics/Soulseek/.incomplete").mkdir(parents=True, exist_ok=True)
     threading.Thread(target=telegram_loop, daemon=True).start()
     threading.Thread(target=watcher_loop,  daemon=True).start()
+    threading.Thread(target=_dns_watchdog, daemon=True).start()
     app.run(host="0.0.0.0", port=8888, debug=False)
