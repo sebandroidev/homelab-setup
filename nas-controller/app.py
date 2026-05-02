@@ -153,9 +153,10 @@ _bg_lock = threading.Lock()
 # Background lyrics scan lock — prevents concurrent full-library scans
 _lyrics_bg_lock = threading.Lock()
 
-# DNS watchdog state
+# DNS watchdog state — tracks actual Telegram HTTP reachability, not DNS resolution
 _dns_fail_since: float | None = None
-_DNS_RESTART_AFTER = 600  # restart container after 10 min of continuous DNS failure
+_last_tg_success: float = time.time()  # updated on each successful getUpdates
+_DNS_RESTART_AFTER = 600  # restart only if HTTP unreachable AND no poll success for 10 min
 
 # ── NAS Stats ─────────────────────────────────────────────────────────────────
 def _collect_nas_stats() -> dict:
@@ -3419,6 +3420,9 @@ def telegram_loop():
     while True:
         try:
             res = _tg_call("getUpdates", _timeout=35, offset=offset, timeout=30)
+            if res.get("ok") or "result" in res:
+                global _last_tg_success
+                _last_tg_success = time.time()
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
 
@@ -3448,24 +3452,38 @@ def telegram_loop():
 
 # ── DNS watchdog ──────────────────────────────────────────────────────────────
 def _dns_watchdog():
-    """Check api.telegram.org reachability every 60s; restart container after 10 min outage."""
-    import socket as _socket
+    """Test actual HTTPS reachability to Telegram every 60s.
+    Only restarts if HTTP fails AND getUpdates hasn't succeeded for 10+ min.
+    This avoids restarting a working bot just because a fresh DNS lookup fails."""
     global _dns_fail_since
     while True:
         time.sleep(60)
+        http_ok = False
         try:
-            _socket.getaddrinfo("api.telegram.org", 443, timeout=5)
-            if _dns_fail_since is not None:
-                log.info("DNS watchdog: api.telegram.org reachable again — resetting timer")
-            _dns_fail_since = None
+            req = urllib.request.Request(
+                "https://api.telegram.org",
+                headers={"User-Agent": "nas-controller-watchdog/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                http_ok = r.status in (200, 404, 403)  # any real HTTP response = reachable
         except Exception:
-            now = time.time()
+            pass
+
+        now = time.time()
+        poll_age = now - _last_tg_success  # seconds since last successful getUpdates
+
+        if http_ok or poll_age < _DNS_RESTART_AFTER:
+            # Either HTTP works, or polling succeeded recently — bot is fine
+            if _dns_fail_since is not None:
+                log.info("DNS watchdog: Telegram reachable again — resetting timer")
+            _dns_fail_since = None
+        else:
+            # HTTP unreachable AND no successful poll for threshold duration
             if _dns_fail_since is None:
                 _dns_fail_since = now
-                log.warning("DNS watchdog: api.telegram.org unreachable — 10-min restart timer started")
+                log.warning("DNS watchdog: Telegram unreachable — 10-min restart timer started (last poll: %.0fs ago)", poll_age)
             else:
                 elapsed = now - _dns_fail_since
-                log.warning("DNS watchdog: still unreachable (%.0fs / %ds threshold)", elapsed, _DNS_RESTART_AFTER)
+                log.warning("DNS watchdog: still unreachable (%.0fs / %ds, last poll: %.0fs ago)", elapsed, _DNS_RESTART_AFTER, poll_age)
                 if elapsed >= _DNS_RESTART_AFTER:
                     log.warning("DNS watchdog: threshold reached — restarting nas-controller container")
                     subprocess.run(
