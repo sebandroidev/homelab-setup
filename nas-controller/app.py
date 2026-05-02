@@ -980,13 +980,13 @@ def find_missing(playlist: str = "") -> list:
         tracks = [t for t in tracks if t["playlist"] == playlist]
     return [t for t in tracks if not _in_library(t)]
 
-def _slskd(method: str, path: str, body=None):
+def _slskd(method: str, path: str, body=None, timeout: int = 15):
     url  = f"{SLSKD_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req  = urllib.request.Request(url, data=data, method=method,
                headers={"X-API-Key": SLSKD_API_KEY, "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read()) if r.length != 0 else {}
     except urllib.error.HTTPError as e:
         return {"_error": e.code, "_body": e.read().decode()}
@@ -2606,20 +2606,25 @@ def _slskd_search_progressive(query: str):
     res = _slskd("POST", "/api/v0/searches",
                  {"searchText": query, "responseLimit": 30, "fileLimit": 500})
     if "_error" in res:
+        log.warning("slskd search POST failed: %s", res)
         return None, []
     search_id = res.get("id")
     if not search_id:
+        log.warning("slskd search POST returned no id: %s", res)
         return None, []
 
+    log.info("slskd search started: id=%s query=%r", search_id[:8], query)
     snap_raw = []
     for tick in range(30):
         time.sleep(1)
-        info      = _slskd("GET", f"/api/v0/searches/{search_id}")
+        info      = _slskd("GET", f"/api/v0/searches/{search_id}", timeout=4)
         completed = "Completed" in info.get("state", "") or info.get("isComplete")
-        resp      = _slskd("GET", f"/api/v0/searches/{search_id}/responses")
+        resp      = _slskd("GET", f"/api/v0/searches/{search_id}/responses", timeout=4)
         snap_raw  = resp if isinstance(resp, list) else resp.get("responses", [])
         active    = _active_peers_only(snap_raw)
         enough    = len(active) >= 5 and tick >= 4
+        if tick % 5 == 0:
+            log.info("slskd poll tick=%d active_peers=%d completed=%s", tick, len(active), completed)
         if completed or enough:
             if completed:
                 folders = _peer_folders(snap_raw, active_only=True)
@@ -2629,6 +2634,7 @@ def _slskd_search_progressive(query: str):
                     _slskd("DELETE", f"/api/v0/searches/{search_id}")
                 except Exception:
                     pass
+                log.info("slskd search done (completed): %d folders", len(folders))
                 return search_id, folders[:5]
             break  # enough active peers — hand off to background
 
@@ -3534,6 +3540,7 @@ def handle_callback(cq: dict):
             with _bg_lock:
                 _bg_searches.pop(bg_id, None)
         _sess_set(chat_id, {})
+        _result_msgs.pop(chat_id, None)
         tg_send(chat_id, "Cancelled.", reply_markup=TG_KEYBOARD)
         return
 
@@ -3656,6 +3663,7 @@ def handle_tg(chat_id, text):
                         "step": "searching"})
         _sess_set(chat_id, session)
         q = (artist.strip() + " " + rest.strip()).strip()
+        _result_msgs.pop(chat_id, None)
         res    = tg_send(chat_id, f"🔍 Searching Soulseek for *{q}*…",
                          reply_markup=_SEARCH_CANCEL_KB)
         msg_id = res.get("result", {}).get("message_id")
