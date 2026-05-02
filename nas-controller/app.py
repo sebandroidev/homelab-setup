@@ -26,6 +26,10 @@ SLSKD_API_KEY = os.getenv("SLSKD_API_KEY", "cff949683de044ba885fa83b1d01b5d07eca
 LASTFM_KEY    = os.getenv("LASTFM_API_KEY", "")
 DISCOVER_FILE = Path("/data/discover.json")
 
+NAS_SSH_HOST  = os.getenv("NAS_SSH_HOST", "host.docker.internal")
+NAS_SSH_USER  = os.getenv("NAS_SSH_USER", "sebastien")
+NAS_SSH_PASS  = os.getenv("NAS_SSH_PASS", "sebastien")
+
 WATCH_DIRS     = ["/media/sdb/Musics", "/media/sdb/Evyy Musics"]
 AUDIO_EXTS     = {".flac", ".m4a", ".mp3", ".aac", ".ogg", ".opus"}
 WATCH_INTERVAL = 60
@@ -71,19 +75,25 @@ JOBS = {
 EXPOSED_SERVICES = [
     {"name": "Navidrome",   "icon": "🎵", "url": "https://navidrome.bastien-nas.duckdns.org",  "check": "http://host.docker.internal:4533"},
     {"name": "Immich",      "icon": "📸", "url": "https://immich.bastien-nas.duckdns.org",     "check": "http://host.docker.internal:2283"},
-    {"name": "AudioMuse",   "icon": "🎧", "url": "https://audiomuse.bastien-nas.duckdns.org",  "check": "http://host.docker.internal:8001"},
     {"name": "Gitea",       "icon": "🐙", "url": "https://gitea.bastien-nas.duckdns.org",      "check": "http://host.docker.internal:8070"},
-    {"name": "Slskd",       "icon": "🔍", "url": "https://slskd.bastien-nas.duckdns.org",      "check": "http://host.docker.internal:8082"},
+    {"name": "Slskd",       "icon": "🔍", "url": "https://slskd.bastien-nas.duckdns.org",      "check": "http://host.docker.internal:5030"},
     {"name": "Uptime Kuma", "icon": "📡", "url": "https://uptime.bastien-nas.duckdns.org",     "check": "http://host.docker.internal:8071"},
     {"name": "Grafana",     "icon": "📊", "url": "https://grafana.bastien-nas.duckdns.org",    "check": "http://host.docker.internal:3030"},
     {"name": "Orly API",    "icon": "🚀", "url": "https://api.bastien-nas.duckdns.org",        "check": "http://host.docker.internal:4000"},
     {"name": "NAS",         "icon": "🖥",  "url": "https://nas.bastien-nas.duckdns.org",        "check": "http://host.docker.internal:8888"},
+    {"name": "ZimaOS",      "icon": "🏠", "url": "https://home.bastien-nas.duckdns.org",       "check": "http://host.docker.internal:8080"},
+    {"name": "Dokploy",     "icon": "🐳", "url": "https://dokploy.bastien-nas.duckdns.org",    "check": "http://host.docker.internal:3000"},
+    {"name": "AdGuard",     "icon": "🛡",  "url": "https://adguard.bastien-nas.duckdns.org",    "check": "http://host.docker.internal:3080"},
 ]
 
 
 # ── Telegram keyboard ────────────────────────────────────────────────────────
 TG_KEYBOARD = json.dumps({
-    "keyboard": [[{"text": "⬇️ Download Tracks"}, {"text": "📊 NAS Stats"}]],
+    "keyboard": [
+        [{"text": "⬇️ Download Tracks"}, {"text": "📊 NAS Stats"}],
+        [{"text": "🗂 Library"}, {"text": "🔌 NAS Control"}],
+        [{"text": "🌐 Services"}],
+    ],
     "resize_keyboard": True,
     "persistent": True,
 })
@@ -152,6 +162,10 @@ _bg_lock = threading.Lock()
 
 # Background lyrics scan lock — prevents concurrent full-library scans
 _lyrics_bg_lock = threading.Lock()
+
+# Manual library maintenance state
+_maint_running = False
+_maint_state_lock = threading.Lock()
 
 # DNS watchdog state — tracks actual Telegram HTTP reachability, not DNS resolution
 _dns_fail_since: float | None = None
@@ -512,6 +526,194 @@ def _run_lyrics_background():
     finally:
         _lyrics_bg_lock.release()
 
+def _run_manual_maintenance(chat_id: int, msg_id: int):
+    """Manual library sync: art → organize → lyrics (streamed) → navidrome rescan."""
+    global _maint_running
+    t0 = time.time()
+
+    def _elapsed():
+        s = int(time.time() - t0)
+        return f"{s // 60}m {s % 60:02d}s"
+
+    def _edit(text):
+        _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                 text=text, parse_mode="Markdown",
+                 reply_markup=json.dumps({"inline_keyboard": []}))
+
+    # --- Stage 1+2: Art + Organize (serialized under pipeline lock) ---
+    if not _pipeline_lock.acquire(blocking=False):
+        _edit("⚠️ A download pipeline is currently running. Try again when it finishes.")
+        with _maint_state_lock:
+            _maint_running = False
+        return
+
+    art_ok = org_ok = False
+    art_org_error = None
+    try:
+        _edit("🗂 *Library Sync*\n🎨 Fetching art & covers…")
+        r_art = subprocess.run(
+            'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
+            shell=True, capture_output=True, text=True, timeout=1800)
+        for line in (r_art.stdout + r_art.stderr).splitlines():
+            if line.strip():
+                log.info("[maint:art] %s", line.strip())
+        _refresh_all_watch_dirs()
+        art_ok = r_art.returncode == 0
+
+        _edit(f"🗂 *Library Sync*\n🎨 Art {'✓' if art_ok else '⚠️'}\n📦 Organizing…\n⏱ {_elapsed()}")
+        r_org = subprocess.run(
+            'docker exec beets python3 /config/beet-organize.py',
+            shell=True, capture_output=True, text=True, timeout=1800)
+        for line in (r_org.stdout + r_org.stderr).splitlines():
+            if line.strip():
+                log.info("[maint:org] %s", line.strip())
+        _refresh_all_watch_dirs()
+        org_ok = r_org.returncode == 0
+    except Exception as e:
+        log.warning("Manual maintenance art/org error: %s", e)
+        art_org_error = e
+    finally:
+        _pipeline_lock.release()
+
+    if art_org_error:
+        _edit(f"⚠️ Art/organize error: {art_org_error}")
+        with _maint_state_lock:
+            _maint_running = False
+        return
+
+    art_line = f"🎨 Art {'✓' if art_ok else '⚠️'}  📦 Organized {'✓' if org_ok else '⚠️'}"
+
+    # --- Stage 3: Lyrics (streaming) ---
+    if not _lyrics_bg_lock.acquire(blocking=False):
+        _edit(f"🗂 *Library Sync*\n{art_line}\n⚠️ Lyrics scan already running — skipped\n⏱ {_elapsed()}")
+        with _maint_state_lock:
+            _maint_running = False
+        return
+
+    try:
+        _edit(f"🗂 *Library Sync*\n{art_line}\n🎵 Starting lyrics fetch…\n⏱ {_elapsed()}")
+        n_done = 0
+        current_track = ""
+        lyrics_summary = ""
+        last_edit = 0.0
+
+        proc = subprocess.Popen(
+            "python3 /DATA/AppData/beets/all-lyrics.py",
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip()
+            log.info("[maint:lyrics] %s", line)
+            if "=== Done:" in line:
+                lyrics_summary = line.strip()
+            elif " -> synced OK" in line:
+                current_track = line.split(" -> ")[0].strip()
+                n_done += 1
+            elif " -> " in line:
+                current_track = line.split(" -> ")[0].strip()
+
+            if time.time() - last_edit >= 5:
+                track_line = f"\n▶ `{_esc(current_track)}`" if current_track else ""
+                _edit(
+                    f"🗂 *Library Sync*\n{art_line}\n"
+                    f"🎵 Fetching lyrics…{track_line}\n"
+                    f"📊 {n_done} synced · ⏱ {_elapsed()}"
+                )
+                last_edit = time.time()
+
+        proc.wait()
+
+        # Parse summary into clean line
+        m = re.search(r"written=(\d+).*?skipped=(\d+).*?missing=(\d+).*?errors=(\d+)", lyrics_summary)
+        if m:
+            w, sk, ms, er = m.groups()
+            summary_line = f"written={w} · skipped={sk} · missing={ms} · errors={er}"
+        else:
+            summary_line = lyrics_summary or f"{n_done} tracks processed"
+
+        # Navidrome rescan
+        try:
+            _nav_request("startScan")
+            log.info("[maint] Navidrome rescan triggered")
+        except Exception as _e:
+            log.warning("[maint] Navidrome rescan failed: %s", _e)
+
+        _edit(
+            f"🗂 *Library Sync* ✅\n{art_line}\n"
+            f"🎵 {summary_line}\n"
+            f"⏱ Total: {_elapsed()}"
+        )
+        log.info("[maint] Done in %s", _elapsed())
+
+    except Exception as e:
+        log.warning("Manual maintenance lyrics error: %s", e)
+        try:
+            _edit(f"⚠️ Lyrics error: {e}\n⏱ {_elapsed()}")
+        except Exception:
+            pass
+    finally:
+        _lyrics_bg_lock.release()
+        with _maint_state_lock:
+            _maint_running = False
+
+
+def _ssh_host(cmd: str, timeout: int = 20):
+    """Run a command on the NAS host via SSH."""
+    return subprocess.run(
+        f"sshpass -p '{NAS_SSH_PASS}' ssh -o StrictHostKeyChecking=no "
+        f"-o ConnectTimeout=10 {NAS_SSH_USER}@{NAS_SSH_HOST} "
+        f"\"echo '{NAS_SSH_PASS}' | sudo -S {cmd}\"",
+        shell=True, capture_output=True, text=True, timeout=timeout)
+
+# ── NAS power action definitions ──────────────────────────────────────────────
+_NAS_ACTIONS = {
+    "reboot": {
+        "label": "🔄 Restart NAS",
+        "confirm_text": "⚠️ *Restart NAS?*\nAll services will be unavailable for ~1–2 min.",
+        "cmd": "reboot",
+        "ack": "🔄 Restarting NAS… back in ~2 min.",
+    },
+    "restart_bot": {
+        "label": "🤖 Restart Bot",
+        "confirm_text": "⚠️ *Restart the bot container?*\nBot will be offline for ~10 sec.",
+        "cmd": "docker restart nas-controller",
+        "ack": "🤖 Bot restarting… tap any button in ~15 sec.",
+    },
+    "restart_docker": {
+        "label": "🐳 Restart Docker",
+        "confirm_text": "⚠️ *Restart Docker daemon?*\nAll containers will stop and restart (~1 min).",
+        "cmd": "systemctl restart docker",
+        "ack": "🐳 Docker restarting… all containers back in ~1 min.",
+    },
+}
+
+def _nas_control_menu_kb():
+    rows = [[{"text": a["label"], "callback_data": f"nas:{key}"}]
+            for key, a in _NAS_ACTIONS.items()]
+    rows.append([{"text": "❌ Close", "callback_data": "nas:cancel"}])
+    return _inline(rows)
+
+def _handle_nas_action(chat_id: int, msg_id: int, action_key: str):
+    action = _NAS_ACTIONS[action_key]
+    log.info("[nas] Executing: %s", action_key)
+    _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+             text=action["ack"], parse_mode="Markdown",
+             reply_markup=json.dumps({"inline_keyboard": []}))
+    try:
+        r = _ssh_host(action["cmd"])
+        if r.returncode != 0 and r.stderr.strip():
+            log.warning("[nas] %s stderr: %s", action_key, r.stderr.strip())
+    except Exception as e:
+        log.warning("[nas] %s failed: %s", action_key, e)
+        try:
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text=f"⚠️ Command failed: {e}", parse_mode="Markdown",
+                     reply_markup=json.dumps({"inline_keyboard": []}))
+        except Exception:
+            pass
+
+
 def _run_watch_pipeline(dir_path, files):
     global _pipeline_waiting
 
@@ -560,10 +762,10 @@ def _run_watch_pipeline(dir_path, files):
         # In batch mode, suppress noisy per-dir start messages
         if not is_batch:
             if watcher_dl_id:
-                _wpipe_stage("importing")
                 _wpipe_log(f"Beets import starting: {short}")
             else:
                 _notify_tg(f"🔔 *New music detected!*\n📁 `{short}` ({count} track{'s' if count!=1 else ''})\n▶️ Running beets import…")
+        _wpipe_stage("importing")
 
         def _log_proc(label: str, r):
             for line in (r.stdout + r.stderr).splitlines():
@@ -582,6 +784,7 @@ def _run_watch_pipeline(dir_path, files):
             # Snapshot existing paths before global ops — used to detect organize destinations
             seen_before_global_ops = set(_seen_files.keys())
             # fetchart + embedart run on whole library — do once after all imports
+            _wpipe_stage("art")
             r_art = subprocess.run(
                 'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
                 shell=True, capture_output=True, text=True, timeout=1800)
@@ -605,8 +808,8 @@ def _run_watch_pipeline(dir_path, files):
             if not fresh_dirs:
                 fresh_dirs.add(dir_path)  # fallback: original detected dir
             # Lyrics also run once at the end, scoped to fresh dirs only
+            _wpipe_stage("lyrics")
             if not is_batch:
-                _wpipe_stage("lyrics")
                 _wpipe_log("Lyrics fetch starting…")
                 _wpipe_notify("▶️ Running lyrics fetch…")
             # Phase 1 — priority: fetch lyrics only for newly imported/organized tracks
@@ -1991,9 +2194,11 @@ def tg_send(chat_id, text, reply_markup=None):
         kwargs["reply_markup"] = reply_markup
     return _tg_call("sendMessage", **kwargs)
 
-def tg_edit(chat_id, msg_id, text):
-    _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
-             text=text, parse_mode="Markdown")
+def tg_edit(chat_id, msg_id, text, reply_markup=None):
+    kwargs = dict(chat_id=chat_id, message_id=msg_id, text=text, parse_mode="Markdown")
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    _tg_call("editMessageText", **kwargs)
 
 def _tail(lines, n=30, max_chars=3000):
     t = "".join(lines[-n:]); return t[-max_chars:]
@@ -3166,12 +3371,69 @@ def handle_callback(cq: dict):
     chat_id = cq.get("message", {}).get("chat", {}).get("id")
     if not chat_id:
         return
+    log.info("Callback: %s from %s", data, chat_id)
     _tg_call("answerCallbackQuery", callback_query_id=cq_id)
 
     if data == "stats:refresh":
         msg_id = cq.get("message", {}).get("message_id")
         threading.Thread(target=_send_nas_stats, args=(chat_id, msg_id), daemon=True).start()
         return
+
+    if data == "services:refresh":
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_send_services_status, args=(chat_id, msg_id), daemon=True).start()
+        return
+
+    if data == "maint:confirm":
+        global _maint_running
+        msg_id = cq.get("message", {}).get("message_id")
+        with _maint_state_lock:
+            if _maint_running:
+                _tg_call("answerCallbackQuery", callback_query_id=cq_id,
+                         text="⚠️ Already running!", show_alert=True)
+                return
+            _maint_running = True
+        log.info("[maint] Starting manual library sync for chat %s msg %s", chat_id, msg_id)
+        threading.Thread(target=_run_manual_maintenance, args=(chat_id, msg_id), daemon=True).start()
+        return
+
+    if data == "maint:cancel":
+        msg_id = cq.get("message", {}).get("message_id")
+        if msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        tg_send(chat_id, "Cancelled.", reply_markup=TG_KEYBOARD)
+        return
+
+    # ── NAS Control ───────────────────────────────────────────────────────────
+    if data.startswith("nas:"):
+        msg_id = cq.get("message", {}).get("message_id")
+        action_key = data[4:]  # strip "nas:"
+
+        if action_key == "cancel":
+            if msg_id:
+                _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+            return
+
+        if action_key in _NAS_ACTIONS:
+            # First tap: show confirmation
+            action = _NAS_ACTIONS[action_key]
+            kb = _inline([
+                [{"text": "✅ Confirm", "callback_data": f"nas:do:{action_key}"},
+                 {"text": "❌ Cancel",  "callback_data": "nas:cancel"}],
+            ])
+            if msg_id:
+                _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                         text=action["confirm_text"], parse_mode="Markdown",
+                         reply_markup=kb)
+            return
+
+        if action_key.startswith("do:"):
+            key = action_key[3:]
+            if key not in _NAS_ACTIONS:
+                return
+            threading.Thread(target=_handle_nas_action,
+                             args=(chat_id, msg_id, key), daemon=True).start()
+            return
 
     session = _sess_get(chat_id)
     parts   = data.split(":")
@@ -3411,7 +3673,156 @@ def handle_tg(chat_id, text):
         threading.Thread(target=_send_nas_stats, args=(chat_id,), daemon=True).start()
         return
 
-    tg_send(chat_id, "Tap *⬇️ Download Tracks* to search music or *📊 NAS Stats* for system info.", reply_markup=TG_KEYBOARD)
+    if "library" in t or "🗂" in text:
+        kb = _inline([
+            [{"text": "▶️ Run now", "callback_data": "maint:confirm"},
+             {"text": "❌ Cancel", "callback_data": "maint:cancel"}],
+        ])
+        tg_send(chat_id, "🗂 *Library Sync*\nRuns: art fetch → organize → full lyrics scan → Navidrome rescan.\nThis takes ~15 min.", reply_markup=kb)
+        return
+
+    if "nas control" in t or "control" in t or "🔌" in text:
+        tg_send(chat_id, "🔌 *NAS Control*\nChoose an action:", reply_markup=_nas_control_menu_kb())
+        return
+
+    if "services" in t or "🌐" in text:
+        threading.Thread(target=_send_services_status, args=(chat_id,), daemon=True).start()
+        return
+
+    tg_send(chat_id, "Tap a button below.", reply_markup=TG_KEYBOARD)
+
+def _check_service(svc: dict) -> bool:
+    try:
+        with urllib.request.urlopen(svc["check"], timeout=5) as r:
+            return r.status < 500
+    except Exception:
+        return False
+
+def _send_services_status(chat_id: int, msg_id: int | None = None):
+    """Check all EXPOSED_SERVICES in parallel and send/edit a status message."""
+    import concurrent.futures
+
+    placeholder = "🌐 *Services*\n\n⏳ Checking…"
+    if msg_id is None:
+        sent = tg_send(chat_id, placeholder)
+        msg_id = sent.get("result", {}).get("message_id") if sent else None
+    else:
+        tg_edit(chat_id, msg_id, placeholder)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(EXPOSED_SERVICES)) as pool:
+        futures = {pool.submit(_check_service, svc): svc["name"] for svc in EXPOSED_SERVICES}
+        results = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
+
+    online  = sum(1 for ok in results.values() if ok)
+    total   = len(EXPOSED_SERVICES)
+    summary = f"{'✅' if online == total else '⚠️'} {online}/{total} online"
+
+    lines = [f"🌐 *Services* — {summary}", ""]
+    for svc in EXPOSED_SERVICES:
+        ok     = results.get(svc["name"], False)
+        status = "✅" if ok else "❌"
+        lines.append(f"{status} {svc['icon']} [{svc['name']}]({svc['url']})")
+
+    now = time.strftime("%H:%M")
+    lines += ["", f"_Checked at {now}_"]
+
+    refresh_kb = _inline([[{"text": "🔄 Refresh", "callback_data": "services:refresh"}]])
+    if msg_id:
+        tg_edit(chat_id, msg_id, "\n".join(lines), reply_markup=refresh_kb)
+    else:
+        tg_send(chat_id, "\n".join(lines), reply_markup=refresh_kb)
+
+def _startup_notification():
+    """Send a Telegram boot message if this is a fresh NAS startup (uptime < 3 min)."""
+    try:
+        uptime_secs = float(open("/proc/uptime").read().split()[0])
+    except Exception:
+        return
+    if uptime_secs > 180:
+        log.info("[startup] Bot restarted (uptime %ds) — skipping boot notification", int(uptime_secs))
+        return
+
+    log.info("[startup] Fresh NAS boot detected (uptime %ds) — waiting 60s for services…", int(uptime_secs))
+    time.sleep(60)
+
+    # Service health checks
+    results = []
+    for svc in EXPOSED_SERVICES:
+        ok = _check_service(svc)
+        results.append((svc["icon"], svc["name"], ok))
+
+    # Container count
+    container_count = "?"
+    try:
+        r = subprocess.run(["/usr/bin/docker", "ps", "-q"],
+                           capture_output=True, text=True, timeout=8)
+        container_count = str(len(r.stdout.strip().splitlines()))
+    except Exception:
+        pass
+
+    # RAM usage
+    mem_line = ""
+    try:
+        mem: dict = {}
+        for line in open("/proc/meminfo"):
+            k, _, v = line.partition(":")
+            mem[k.strip()] = int(v.strip().split()[0])
+        total = mem.get("MemTotal", 0)
+        avail = mem.get("MemAvailable", 0)
+        used  = total - avail
+        pct   = used * 100 // total if total else 0
+        mem_line = f"💾 RAM {pct}%"
+    except Exception:
+        pass
+
+    # CPU temp
+    import glob as _glob
+    temp_line = ""
+    try:
+        temps = [int(open(tf).read().strip()) // 1000
+                 for tf in sorted(_glob.glob("/sys/class/thermal/thermal_zone*/temp"))
+                 if int(open(tf).read().strip()) // 1000 > 0]
+        if temps:
+            temp_line = f"🌡 {temps[0]}°C"
+    except Exception:
+        pass
+
+    # Current uptime (after the 60s wait)
+    try:
+        up2 = float(open("/proc/uptime").read().split()[0])
+        h, rem = divmod(int(up2), 3600)
+        m = rem // 60
+        uptime_str = f"{h}h {m}m" if h else f"{m}m"
+    except Exception:
+        uptime_str = "?"
+
+    # Format services as 2-column grid
+    svc_lines = []
+    for i in range(0, len(results), 2):
+        left  = results[i]
+        right = results[i + 1] if i + 1 < len(results) else None
+        l_str = f"{'✅' if left[2] else '❌'} {left[1]}"
+        if right:
+            r_str = f"{'✅' if right[2] else '❌'} {right[1]}"
+            svc_lines.append(f"{l_str:<20}{r_str}")
+        else:
+            svc_lines.append(l_str)
+
+    offline = [name for _, name, ok in results if not ok]
+    status_icon = "✅" if not offline else "⚠️"
+
+    lines = [f"🖥 *NAS is back online* {status_icon} · up {uptime_str}", ""]
+    lines += [f"`{l}`" for l in svc_lines]
+    lines += [""]
+    meta = "  ".join(filter(None, [f"📦 {container_count} containers", temp_line, mem_line]))
+    if meta:
+        lines.append(meta)
+    if offline:
+        lines.append(f"\n⚠️ Offline: {', '.join(offline)}")
+
+    _notify_tg("\n".join(lines), force=True)
+    log.info("[startup] Boot notification sent (%d services, %d offline)", len(results), len(offline))
+
 
 def telegram_loop():
     if not BOT_TOKEN:
@@ -3445,9 +3856,7 @@ def telegram_loop():
                     if not chat_id or (ALLOWED_IDS and str(chat_id) not in ALLOWED_IDS):
                         _tg_call("answerCallbackQuery", callback_query_id=cq.get("id",""))
                         continue
-                    data = cq.get("data", "")
-                    if data.startswith("dl:"):
-                        handle_callback(cq)
+                    handle_callback(cq)
         except Exception as e:
             log.error("Telegram poll: %s", e); time.sleep(5)
 
@@ -3498,7 +3907,8 @@ if __name__ == "__main__":
     _load_discover()
     # slskd ≥0.25 validates (not creates) its incomplete dir at startup — ensure it exists
     Path("/media/sdb/Musics/Soulseek/.incomplete").mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=telegram_loop, daemon=True).start()
-    threading.Thread(target=watcher_loop,  daemon=True).start()
-    threading.Thread(target=_dns_watchdog, daemon=True).start()
+    threading.Thread(target=telegram_loop,          daemon=True).start()
+    threading.Thread(target=watcher_loop,            daemon=True).start()
+    threading.Thread(target=_dns_watchdog,           daemon=True).start()
+    threading.Thread(target=_startup_notification,   daemon=True).start()
     app.run(host="0.0.0.0", port=8888, debug=False)
