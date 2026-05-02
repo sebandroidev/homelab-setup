@@ -3621,21 +3621,25 @@ def handle_callback(cq: dict):
         action = parts[1]
         dl_id  = parts[2]
         msg_id = cq.get("message", {}).get("message_id")
+        not_tracked = False
         with _dl_lock:
             if dl_id not in _downloads:
-                if msg_id: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
-                tg_send(chat_id, "⚠️ Download no longer tracked (bot was restarted). Tap *⬇️ Download Tracks* to start a new search.", reply_markup=TG_KEYBOARD)
-                return
-            d = _downloads[dl_id]
-            if action == "pause" and d.get("status") == "downloading":
-                d["status"] = "paused"
-            elif action == "resume" and d.get("status") == "paused":
-                d["status"] = "downloading"
-            elif action == "abort":
-                d["status"] = "error"
-                _dl_log(dl_id, "Cancelled by user.")
-            elif action == "clear":
-                pass  # just remove the message
+                not_tracked = True
+            else:
+                d = _downloads[dl_id]
+                if action == "pause" and d.get("status") == "downloading":
+                    d["status"] = "paused"
+                elif action == "resume" and d.get("status") == "paused":
+                    d["status"] = "downloading"
+                elif action == "abort":
+                    d["status"] = "error"
+                    _dl_log(dl_id, "Cancelled by user.")
+                elif action == "clear":
+                    pass  # just remove the message
+        if not_tracked:
+            if msg_id: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+            tg_send(chat_id, "⚠️ Download no longer tracked (bot was restarted). Tap *⬇️ Download Tracks* to start a new search.", reply_markup=TG_KEYBOARD)
+            return
         if action == "clear" and msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
             _sess_set(chat_id, {})
