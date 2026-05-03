@@ -166,6 +166,7 @@ _lyrics_bg_lock = threading.Lock()
 # Manual library maintenance state
 _maint_running = False
 _maint_state_lock = threading.Lock()
+_pending_duplicates: dict = {}  # chat_id → list of dup groups from beet-organize
 
 # DNS watchdog state — tracks actual Telegram HTTP reachability, not DNS resolution
 _dns_fail_since: float | None = None
@@ -569,6 +570,10 @@ def _run_manual_maintenance(chat_id: int, msg_id: int):
                 log.info("[maint:org] %s", line.strip())
         _refresh_all_watch_dirs()
         org_ok = r_org.returncode == 0
+        org_dups = _parse_org_duplicates(r_org.stdout)
+        if org_dups:
+            threading.Thread(target=_send_duplicates_prompt,
+                             args=(chat_id, org_dups), daemon=True).start()
     except Exception as e:
         log.warning("Manual maintenance art/org error: %s", e)
         art_org_error = e
@@ -796,6 +801,10 @@ def _run_watch_pipeline(dir_path, files):
                 'docker exec beets python3 /config/beet-organize.py',
                 shell=True, capture_output=True, text=True, timeout=1800)
             _log_proc("organize", r_org)
+            org_dups = _parse_org_duplicates(r_org.stdout)
+            if org_dups:
+                threading.Thread(target=_send_duplicates_prompt,
+                                 args=(chat_id, org_dups), daemon=True).start()
             # Pre-register organized files (new paths) before next watcher scan
             _refresh_all_watch_dirs()
             # Fresh dirs = directories of paths that didn't exist before global ops.
@@ -3375,6 +3384,57 @@ def _do_yt_search(chat_id: int, session: dict, msg_id: int):
     _show_result(chat_id, session)
 
 
+def _parse_org_duplicates(stdout: str) -> list:
+    """Extract duplicate groups from beet-organize stdout."""
+    for line in stdout.splitlines():
+        if line.startswith("DUPLICATES_JSON:"):
+            try:
+                return json.loads(line[len("DUPLICATES_JSON:"):].strip())
+            except Exception:
+                pass
+    return []
+
+
+def _fmt_size(b: int) -> str:
+    if b >= 1024 * 1024:
+        return f"{b / 1024 / 1024:.0f} MB"
+    return f"{b / 1024:.0f} KB"
+
+
+def _send_duplicates_prompt(chat_id: int, dups: list):
+    """Send a Telegram message listing duplicates with delete/skip buttons."""
+    global _pending_duplicates
+    if not dups:
+        return
+    _pending_duplicates[chat_id] = dups
+
+    total_del = sum(len(g["delete"]) for g in dups)
+    lines = [f"🔍 *{len(dups)} duplicate group(s)* — {total_del} file(s) to remove\n"]
+
+    shown = 0
+    for g in dups:
+        if shown >= 12:
+            lines.append(f"_…and {len(dups) - shown} more group(s)_")
+            break
+        k = g["keep"]
+        k_label = Path(k["path"]).name
+        k_info  = f"{k['format'].upper() or '?'} · {_fmt_size(k['size'])}"
+        lines.append(f"*{_esc(k['artist'])} — {_esc(k['title'])}*")
+        lines.append(f"  ✅ Keep: `{_esc(k_label)}` ({k_info})")
+        for d in g["delete"]:
+            d_label = Path(d["path"]).name
+            d_info  = f"{d['format'].upper() or '?'} · {_fmt_size(d['size'])}"
+            lines.append(f"  🗑 Del:  `{_esc(d_label)}` ({d_info})")
+        lines.append("")
+        shown += 1
+
+    kb = json.dumps({"inline_keyboard": [[
+        {"text": f"🗑 Delete {total_del} duplicate(s)", "callback_data": "maint:dup:delete"},
+        {"text": "✅ Keep all",                          "callback_data": "maint:dup:skip"},
+    ]]})
+    tg_send(chat_id, "\n".join(lines), reply_markup=kb)
+
+
 def handle_callback(cq: dict):
     """Handle all dl:* inline keyboard callbacks."""
     cq_id   = cq.get("id", "")
@@ -3413,6 +3473,67 @@ def handle_callback(cq: dict):
         if msg_id:
             _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
         tg_send(chat_id, "Cancelled.", reply_markup=TG_KEYBOARD)
+        return
+
+    if data == "maint:dup:skip":
+        msg_id = cq.get("message", {}).get("message_id")
+        _pending_duplicates.pop(chat_id, None)
+        if msg_id:
+            _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                     text="✅ Duplicates kept.", parse_mode="Markdown")
+        return
+
+    if data == "maint:dup:delete":
+        msg_id = cq.get("message", {}).get("message_id")
+        dups = _pending_duplicates.pop(chat_id, [])
+        if not dups:
+            if msg_id:
+                _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                         text="⚠️ No pending duplicates found.")
+            return
+
+        def _do_delete_dups(chat_id, msg_id, dups):
+            deleted_files, failed_files = [], []
+            for g in dups:
+                for d in g["delete"]:
+                    p = Path(d["path"])
+                    try:
+                        if p.exists():
+                            p.unlink()
+                        import subprocess as sp
+                        sp.run(
+                            f'docker exec beets beet remove -d --yes "{d["path"]}"',
+                            shell=True, capture_output=True, timeout=30)
+                        deleted_files.append(p.name)
+                        log.info("[dups] Deleted: %s", p)
+                    except Exception as e:
+                        failed_files.append(p.name)
+                        log.warning("[dups] Failed to delete %s: %s", p, e)
+
+            # Clean empty dirs
+            import subprocess as sp
+            sp.run('docker exec beets python3 -c "'
+                   'from pathlib import Path\n'
+                   'r = Path(\'/music\')\n'
+                   'for d in sorted(r.rglob(\'*\'), reverse=True):\n'
+                   '    if d.is_dir() and not any(d.iterdir()): d.rmdir()"',
+                   shell=True, capture_output=True, timeout=30)
+
+            # Navidrome rescan
+            try:
+                _nav_request("startScan")
+            except Exception:
+                pass
+
+            summary = f"🗑 Deleted {len(deleted_files)} duplicate(s)"
+            if failed_files:
+                summary += f"\n⚠️ Failed: {len(failed_files)}"
+            if msg_id:
+                _tg_call("editMessageText", chat_id=chat_id, message_id=msg_id,
+                         text=summary, parse_mode="Markdown")
+            log.info("[dups] Done: deleted=%d failed=%d", len(deleted_files), len(failed_files))
+
+        threading.Thread(target=_do_delete_dups, args=(chat_id, msg_id, dups), daemon=True).start()
         return
 
     # ── NAS Control ───────────────────────────────────────────────────────────
