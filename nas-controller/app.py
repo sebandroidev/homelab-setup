@@ -2727,10 +2727,15 @@ def _inject_tags(flac_path: str, meta: dict):
                capture_output=True, text=True, timeout=30)
     return r.stdout.strip()
 
+def _sanitize_path(name: str) -> str:
+    """Strip characters illegal on NTFS/FAT from a filename component."""
+    import re
+    return re.sub(r'[\\/:*?"<>|]', '', name).strip()
+
 def _ytdl_download_worker(dl_id: str, video_id: str, artist: str, title: str,
                           meta: dict = None):
     """Download a YouTube track as FLAC into the Soulseek downloads dir."""
-    out_dir = os.path.join(DOWNLOADS_DIR, f"{artist} - {title}")
+    out_dir = os.path.join(DOWNLOADS_DIR, f"{_sanitize_path(artist)} - {_sanitize_path(title)}")
     os.makedirs(out_dir, exist_ok=True)
     cmd = [
         "yt-dlp",
