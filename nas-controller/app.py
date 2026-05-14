@@ -12,9 +12,10 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS   = set(filter(None, os.getenv("TELEGRAM_CHAT_IDS", "").split(",")))
-HISTORY_FILE  = Path("/data/history.json")
-SEEN_FILE     = Path("/data/seen_files.json")
-SPOTIFY_FILE  = Path("/data/spotify.json")
+HISTORY_FILE   = Path("/data/history.json")
+SEEN_FILE      = Path("/data/seen_files.json")
+SPOTIFY_FILE   = Path("/data/spotify.json")
+DOWNLOADS_FILE = Path("/data/downloads.json")
 
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://host.docker.internal:4533")
 NAV_USER      = os.getenv("NAVIDROME_USER", "sebastien")
@@ -141,6 +142,7 @@ _spotify: dict = {
 _nav_index: set = set()
 _nav_isrc:  set = set()
 _downloads: dict = {}
+_dl_meta:   dict = {}   # dl_id -> {chat_id, msg_id, username, filenames, kind, source}
 _sp_lock = threading.Lock()
 _dl_lock = threading.Lock()
 
@@ -3097,6 +3099,13 @@ def _slskd_download_chosen(dl_id: str, username: str, files_to_dl: list,
     with _dl_lock:
         _downloads[dl_id].update({"status": "downloading",
                                    "started": datetime.now().isoformat(timespec="seconds")})
+        _dl_meta[dl_id] = {
+            "chat_id":   chat_id,
+            "username":  username,
+            "filenames": [f["filename"] for f in files_to_dl],
+            "kind":      kind,
+            "source":    "slskd",
+        }
     payload = [{"filename": f["filename"], "size": f.get("size", 0)} for f in files_to_dl]
     dl_res  = _slskd("POST", f"/api/v0/transfers/downloads/{username}", payload)
     if isinstance(dl_res, dict) and "_error" in dl_res:
@@ -3277,6 +3286,9 @@ def _start_dl(chat_id: int, session: dict):
                          daemon=True).start()
 
     if msg_id:
+        with _dl_lock:
+            _dl_meta.setdefault(dl_id, {})["msg_id"]  = msg_id
+            _dl_meta[dl_id]["chat_id"] = chat_id
         threading.Thread(target=_monitor_download,
                          args=(chat_id, dl_id, msg_id), daemon=True).start()
 
@@ -4039,6 +4051,146 @@ def _dns_watchdog():
                         capture_output=True, timeout=30)
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
+# ── Download persistence + resume ─────────────────────────────────────────────
+_TERMINAL_DL_STATES = {"done", "error", "cancelled"}
+
+
+def _save_downloads():
+    try:
+        DOWNLOADS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _dl_lock:
+            payload = {
+                "downloads": {k: {kk: vv for kk, vv in v.items() if kk != "output"}
+                              for k, v in _downloads.items()
+                              if v.get("status") not in _TERMINAL_DL_STATES},
+                "meta": {k: v for k, v in _dl_meta.items()
+                         if _downloads.get(k, {}).get("status") not in _TERMINAL_DL_STATES},
+            }
+        DOWNLOADS_FILE.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception as e:
+        log.warning("[downloads] save failed: %s", e)
+
+
+def _load_downloads():
+    if not DOWNLOADS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(DOWNLOADS_FILE.read_text())
+        with _dl_lock:
+            for dl_id, entry in (data.get("downloads") or {}).items():
+                entry.setdefault("output", [])
+                _downloads[dl_id] = entry
+            for dl_id, meta in (data.get("meta") or {}).items():
+                _dl_meta[dl_id] = meta
+        return data
+    except Exception as e:
+        log.warning("[downloads] load failed: %s", e)
+        return {}
+
+
+def _downloads_flush_loop():
+    while True:
+        time.sleep(5)
+        _save_downloads()
+
+
+def _resume_slskd_poll(dl_id: str):
+    """Poll slskd for an already-queued download until terminal. No re-queue."""
+    meta = _dl_meta.get(dl_id) or {}
+    username   = meta.get("username", "")
+    filenames  = set(meta.get("filenames") or [])
+    kind       = meta.get("kind", "track")
+    if not username or not filenames:
+        log.warning("[resume] dl=%s missing username/filenames — marking error", dl_id)
+        with _dl_lock:
+            _downloads[dl_id]["status"]   = "error"
+            _downloads[dl_id]["finished"] = datetime.now().isoformat(timespec="seconds")
+        return
+
+    log.info("[resume] dl=%s polling slskd for %d files from %s", dl_id, len(filenames), username)
+    stall_limit  = 300 if kind == "track" else 900
+    queued_since = time.time()
+    for _ in range(1800):
+        time.sleep(3)
+        transfers = _slskd("GET", "/api/v0/transfers/downloads")
+        if isinstance(transfers, dict) and "_error" in transfers:
+            continue
+        states: dict = {}
+        for peer_group in (transfers if isinstance(transfers, list) else []):
+            if peer_group.get("username") != username:
+                continue
+            for d in peer_group.get("directories", []):
+                for f in d.get("files", []):
+                    if f.get("filename") in filenames:
+                        states[f["filename"]] = f
+        if not states:
+            if time.time() - queued_since > stall_limit:
+                with _dl_lock:
+                    _downloads[dl_id].update({"status": "error",
+                                               "finished": datetime.now().isoformat(timespec="seconds"),
+                                               "progress": {"pct": 0, "stage": "lost",
+                                                            "summary": "❌ Transfer lost — slskd no longer tracks it"}})
+                return
+            continue
+        done    = sum(1 for f in states.values() if "Completed" in f.get("state","") and "Succeeded" in f.get("state",""))
+        errored = sum(1 for f in states.values() if "Completed" in f.get("state","") and "Succeeded" not in f.get("state",""))
+        total   = len(filenames)
+        avg_pct = sum(f.get("percentComplete", 0) for f in states.values()) / max(len(states), 1)
+        with _dl_lock:
+            _downloads[dl_id]["progress"] = {
+                "pct": int(avg_pct), "stage": "downloading",
+                "summary": f"📡 Resumed · {done}/{total} done, {errored} errors · {avg_pct:.0f}%",
+            }
+        if done + errored >= total:
+            with _dl_lock:
+                if errored == 0:
+                    _downloads[dl_id].update({"status": "done",
+                                               "finished": datetime.now().isoformat(timespec="seconds")})
+                else:
+                    _downloads[dl_id].update({"status": "error",
+                                               "finished": datetime.now().isoformat(timespec="seconds")})
+            return
+
+
+def _load_and_resume_downloads():
+    _load_downloads()
+    with _dl_lock:
+        resumable = [dl_id for dl_id, e in _downloads.items()
+                     if e.get("status") not in _TERMINAL_DL_STATES]
+    if not resumable:
+        return
+    log.info("[resume] %d download(s) to resume", len(resumable))
+    for dl_id in resumable:
+        meta = _dl_meta.get(dl_id) or {}
+        chat_id = meta.get("chat_id")
+        msg_id  = meta.get("msg_id")
+        source  = meta.get("source", "slskd")
+        if source != "slskd":
+            with _dl_lock:
+                _downloads[dl_id].update({"status": "error",
+                                           "finished": datetime.now().isoformat(timespec="seconds"),
+                                           "progress": {"pct": 0, "stage": "lost",
+                                                        "summary": "❌ Interrupted by restart (yt-dlp can't resume)"}})
+            if chat_id and msg_id:
+                try:
+                    tg_edit(chat_id, msg_id, "❌ Download interrupted by container restart.")
+                except Exception:
+                    pass
+            continue
+        if chat_id and msg_id:
+            try:
+                tg_edit(chat_id, msg_id,
+                        "📡 _Resumed monitoring after restart — slskd is still downloading._\n\n" +
+                        _progress_text(dl_id),
+                        reply_markup=_progress_keyboard(dl_id))
+            except Exception as e:
+                log.warning("[resume] dl=%s edit failed (likely >48h old): %s", dl_id, e)
+        threading.Thread(target=_resume_slskd_poll, args=(dl_id,), daemon=True).start()
+        if chat_id and msg_id:
+            threading.Thread(target=_monitor_download,
+                             args=(chat_id, dl_id, msg_id), daemon=True).start()
+
+
 if __name__ == "__main__":
     _load_history()
     _load_seen()
@@ -4049,4 +4201,6 @@ if __name__ == "__main__":
     threading.Thread(target=watcher_loop,            daemon=True).start()
     threading.Thread(target=_dns_watchdog,           daemon=True).start()
     threading.Thread(target=_startup_notification,   daemon=True).start()
+    threading.Thread(target=_downloads_flush_loop,   daemon=True).start()
+    _load_and_resume_downloads()
     app.run(host="0.0.0.0", port=8888, debug=False)
