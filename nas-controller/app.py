@@ -73,19 +73,24 @@ JOBS = {
 
 
 # ── Exposed Services ─────────────────────────────────────────────────────────
+LAB_IP = os.getenv("LAB_IP", "192.168.1.78")
+
 EXPOSED_SERVICES = [
-    {"name": "Navidrome",   "icon": "🎵", "url": "https://navidrome.bastien-nas.duckdns.org",  "check": "http://host.docker.internal:4533"},
-    {"name": "Immich",      "icon": "📸", "url": "https://immich.bastien-nas.duckdns.org",     "check": "http://host.docker.internal:2283"},
-    {"name": "Gitea",       "icon": "🐙", "url": "https://gitea.bastien-nas.duckdns.org",      "check": "http://host.docker.internal:8070"},
-    {"name": "Slskd",       "icon": "🔍", "url": "https://slskd.bastien-nas.duckdns.org",      "check": "http://host.docker.internal:5030"},
-    {"name": "Uptime Kuma", "icon": "📡", "url": "https://uptime.bastien-nas.duckdns.org",     "check": "http://host.docker.internal:8071"},
-    {"name": "Grafana",     "icon": "📊", "url": "https://grafana.bastien-nas.duckdns.org",    "check": "http://host.docker.internal:3030"},
-    {"name": "Orly API",    "icon": "🚀", "url": "https://api.bastien-nas.duckdns.org",        "check": "http://host.docker.internal:4000"},
-    {"name": "NAS",         "icon": "🖥",  "url": "https://nas.bastien-nas.duckdns.org",        "check": "http://host.docker.internal:8888"},
-    {"name": "ZimaOS",      "icon": "🏠", "url": "https://home.bastien-nas.duckdns.org",       "check": "http://host.docker.internal:8080"},
-    {"name": "Dokploy",     "icon": "🐳", "url": "https://dokploy.bastien-nas.duckdns.org",    "check": "http://host.docker.internal:3000"},
-    {"name": "AdGuard",     "icon": "🛡",  "url": "https://adguard.bastien-nas.duckdns.org",    "check": "http://host.docker.internal:3080"},
+    {"name": "Navidrome",   "icon": "🎵", "online": "https://navidrome.bastienlab.com",  "lan_port": 4533,  "check": "http://host.docker.internal:4533"},
+    {"name": "Immich",      "icon": "📸", "online": "https://immich.bastienlab.com",     "lan_port": 2283,  "check": "http://host.docker.internal:2283"},
+    {"name": "Slskd",       "icon": "🔍", "online": "https://slskd.bastienlab.com",      "lan_port": 5030,  "check": "http://host.docker.internal:5030"},
+    {"name": "Orly Jams",   "icon": "🎶", "online": "https://playlists.bastienlab.com",  "lan_port": 7070,  "check": "http://host.docker.internal:7070"},
+    {"name": "Uptime Kuma", "icon": "📡", "online": "https://uptime.bastienlab.com",     "lan_port": 3001,  "check": "http://host.docker.internal:3001"},
+    {"name": "Grafana",     "icon": "📊", "online": "https://grafana.bastienlab.com",    "lan_port": 3030,  "check": "http://host.docker.internal:3030"},
+    {"name": "Files",       "icon": "📁", "online": "https://files.bastienlab.com",      "lan_port": 10081, "check": "http://host.docker.internal:10081"},
+    {"name": "Dokploy",     "icon": "🐳", "online": "https://dokploy.bastienlab.com",    "lan_port": 3000,  "check": "http://host.docker.internal:3000"},
 ]
+
+
+def _svc_url(svc: dict, mode: str) -> str:
+    if mode == "lan":
+        return f"http://{LAB_IP}:{svc['lan_port']}"
+    return svc["online"]
 
 
 # ── Telegram keyboard ────────────────────────────────────────────────────────
@@ -3462,9 +3467,16 @@ def handle_callback(cq: dict):
         threading.Thread(target=_send_nas_stats, args=(chat_id, msg_id), daemon=True).start()
         return
 
-    if data == "services:refresh":
+    if data.startswith("services:refresh"):
         msg_id = cq.get("message", {}).get("message_id")
-        threading.Thread(target=_send_services_status, args=(chat_id, msg_id), daemon=True).start()
+        mode   = data.split(":", 2)[2] if data.count(":") >= 2 else "online"
+        threading.Thread(target=_send_services_status, args=(chat_id, msg_id, mode), daemon=True).start()
+        return
+
+    if data.startswith("services:mode:"):
+        msg_id = cq.get("message", {}).get("message_id")
+        mode   = data.split(":", 2)[2]
+        threading.Thread(target=_send_services_status, args=(chat_id, msg_id, mode), daemon=True).start()
         return
 
     if data == "maint:confirm":
@@ -3848,11 +3860,14 @@ def _check_service(svc: dict) -> bool:
     except Exception:
         return False
 
-def _send_services_status(chat_id: int, msg_id: int | None = None):
-    """Check all EXPOSED_SERVICES in parallel and send/edit a status message."""
+def _send_services_status(chat_id: int, msg_id: int | None = None, mode: str = "online"):
+    """Check all EXPOSED_SERVICES in parallel and send/edit a status message.
+    mode='online' shows public bastienlab.com URLs; mode='lan' shows LAB_IP:port."""
     import concurrent.futures
+    if mode not in ("online", "lan"):
+        mode = "online"
 
-    placeholder = "🌐 *Services*\n\n⏳ Checking…"
+    placeholder = "🛰 *Services*\n\n⏳ Checking…"
     if msg_id is None:
         sent = tg_send(chat_id, placeholder)
         msg_id = sent.get("result", {}).get("message_id") if sent else None
@@ -3863,24 +3878,31 @@ def _send_services_status(chat_id: int, msg_id: int | None = None):
         futures = {pool.submit(_check_service, svc): svc["name"] for svc in EXPOSED_SERVICES}
         results = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
 
-    online  = sum(1 for ok in results.values() if ok)
-    total   = len(EXPOSED_SERVICES)
-    summary = f"{'✅' if online == total else '⚠️'} {online}/{total} online"
+    online_count = sum(1 for ok in results.values() if ok)
+    total        = len(EXPOSED_SERVICES)
+    summary      = f"{'✅' if online_count == total else '⚠️'} {online_count}/{total} up"
+    scope_label  = "🌍 Online URLs" if mode == "online" else f"🏠 LAN URLs ({LAB_IP})"
 
-    lines = [f"🌐 *Services* — {summary}", ""]
+    lines = [f"🛰 *Services* — {summary}", f"_{scope_label}_", ""]
     for svc in EXPOSED_SERVICES:
         ok     = results.get(svc["name"], False)
         status = "✅" if ok else "❌"
-        lines.append(f"{status} {svc['icon']} [{svc['name']}]({svc['url']})")
+        url    = _svc_url(svc, mode)
+        lines.append(f"{status} {svc['icon']} [{svc['name']}]({url})")
 
     now = time.strftime("%H:%M")
     lines += ["", f"_Checked at {now}_"]
 
-    refresh_kb = _inline([[{"text": "🔄 Refresh", "callback_data": "services:refresh"}]])
+    other_mode  = "lan" if mode == "online" else "online"
+    other_label = "🏠 Show LAN URLs" if mode == "online" else "🌍 Show Online URLs"
+    kb = _inline([
+        [{"text": "🔄 Refresh",    "callback_data": f"services:refresh:{mode}"}],
+        [{"text": other_label,     "callback_data": f"services:mode:{other_mode}"}],
+    ])
     if msg_id:
-        tg_edit(chat_id, msg_id, "\n".join(lines), reply_markup=refresh_kb)
+        tg_edit(chat_id, msg_id, "\n".join(lines), reply_markup=kb)
     else:
-        tg_send(chat_id, "\n".join(lines), reply_markup=refresh_kb)
+        tg_send(chat_id, "\n".join(lines), reply_markup=kb)
 
 def _startup_notification():
     """Send a Telegram boot message if this is a fresh NAS startup (uptime < 3 min)."""
