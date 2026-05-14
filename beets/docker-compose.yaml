@@ -8,8 +8,8 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/London
+      - TZ=Europe/Paris
     volumes:
-      - /DATA/AppData/beets/config:/config
-      - /media/sdb/Musics:/music
-      - /media/sdb/Evyy Musics:/evymusics
+      - /media/nas-hdd/nas-migration-backup-20260506/AppData/beets/config:/config
+      - /media/nas-hdd/Musics:/music
+      - /media/nas-hdd/Evyy Musics:/evymusics
