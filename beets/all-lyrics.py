@@ -12,7 +12,7 @@ from html.parser import HTMLParser
 
 LOG_PATH   = "/data/logs/flac-lyrics.log"
 SKIP_FILE  = "/DATA/AppData/beets/lyrics_skipped.json"
-ALL_DIRS   = ["/media/sdb/Musics", "/media/sdb/Evyy Musics"]
+ALL_DIRS   = ["/media/nas-hdd/Musics", "/media/nas-hdd/Evyy Musics"]
 AUDIO_EXTS = {".flac", ".m4a", ".mp3", ".aac", ".ogg", ".opus"}
 UA = "lrclib-sidecar/1.0"
 GENIUS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN", "")
