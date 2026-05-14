@@ -3857,6 +3857,8 @@ def _check_service(svc: dict) -> bool:
     try:
         with urllib.request.urlopen(svc["check"], timeout=5) as r:
             return r.status < 500
+    except urllib.error.HTTPError as e:
+        return e.code < 500
     except Exception:
         return False
 
