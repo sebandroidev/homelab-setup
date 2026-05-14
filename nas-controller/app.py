@@ -20,7 +20,7 @@ DOWNLOADS_FILE = Path("/data/downloads.json")
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://host.docker.internal:4533")
 NAV_USER      = os.getenv("NAVIDROME_USER", "sebastien")
 NAV_PASS      = os.getenv("NAVIDROME_PASS", "sebastien")
-DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "/media/sdb/Musics/Soulseek")
+DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "/media/nas-hdd/Musics/Soulseek")
 
 SLSKD_URL     = os.getenv("SLSKD_URL", "http://host.docker.internal:5030")
 SLSKD_API_KEY = os.getenv("SLSKD_API_KEY", "cff949683de044ba885fa83b1d01b5d07eca5fd47f00afd4")
@@ -31,13 +31,13 @@ NAS_SSH_HOST  = os.getenv("NAS_SSH_HOST", "host.docker.internal")
 NAS_SSH_USER  = os.getenv("NAS_SSH_USER", "sebastien")
 NAS_SSH_PASS  = os.getenv("NAS_SSH_PASS", "sebastien")
 
-WATCH_DIRS     = ["/media/sdb/Musics", "/media/sdb/Evyy Musics"]
+WATCH_DIRS     = ["/media/nas-hdd/Musics", "/media/nas-hdd/Evyy Musics"]
 AUDIO_EXTS     = {".flac", ".m4a", ".mp3", ".aac", ".ogg", ".opus"}
 WATCH_INTERVAL = 60
 DEBOUNCE_SECS  = 90
 BEETS_DIR_MAP  = {
-    "/media/sdb/Musics":      "/music",
-    "/media/sdb/Evyy Musics": "/evymusics",
+    "/media/nas-hdd/Musics":      "/music",
+    "/media/nas-hdd/Evyy Musics": "/evymusics",
 }
 
 JOBS = {
@@ -67,7 +67,7 @@ JOBS = {
     },
     "backup": {
         "name": "NAS Backup", "icon": "💾",
-        "cmd":  "/media/sdb/Backups/nas-backup.sh",
+        "cmd":  "/media/nas-hdd/Backups/nas-backup.sh",
     },
 }
 
@@ -219,7 +219,7 @@ def _collect_nas_stats() -> dict:
             stats[k] = "?"
 
     try:
-        r = subprocess.run(["df", "--output=used,avail,pcent", "/media/sdb"],
+        r = subprocess.run(["df", "--output=used,avail,pcent", "/media/nas-hdd"],
                            capture_output=True, text=True, timeout=5)
         _, data_line = r.stdout.strip().splitlines()
         used_kb, avail_kb, pct = data_line.split()
@@ -2709,8 +2709,8 @@ def _ytdl_search(query: str) -> list:
 def _host_to_beets_path(host_path: str) -> str:
     """Convert host filesystem path to path as seen inside the beets container."""
     for host_prefix, container_prefix in [
-        ("/media/sdb/Musics", "/music"),
-        ("/media/sdb/Evyy Musics", "/evymusics"),
+        ("/media/nas-hdd/Musics", "/music"),
+        ("/media/nas-hdd/Evyy Musics", "/evymusics"),
     ]:
         if host_path.startswith(host_prefix):
             return container_prefix + host_path[len(host_prefix):]
@@ -4220,7 +4220,7 @@ if __name__ == "__main__":
     _load_seen()
     _load_discover()
     # slskd ≥0.25 validates (not creates) its incomplete dir at startup — ensure it exists
-    Path("/media/sdb/Musics/Soulseek/.incomplete").mkdir(parents=True, exist_ok=True)
+    Path("/media/nas-hdd/Musics/Soulseek/.incomplete").mkdir(parents=True, exist_ok=True)
     threading.Thread(target=telegram_loop,          daemon=True).start()
     threading.Thread(target=watcher_loop,            daemon=True).start()
     threading.Thread(target=_dns_watchdog,           daemon=True).start()
