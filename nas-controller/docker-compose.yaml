@@ -1,3 +1,4 @@
+name: nas-controller
 services:
   nas-controller:
     build: .
@@ -12,22 +13,24 @@ services:
       - NAVIDROME_URL=http://host.docker.internal:4533
       - NAVIDROME_USER=sebastien
       - NAVIDROME_PASS=sebastien
-      - DOWNLOADS_DIR=/media/sdb/Musics/Soulseek
+      - DOWNLOADS_DIR=/media/nas-hdd/Musics/Soulseek
       - SLSKD_URL=http://host.docker.internal:5030
-      - SLSKD_API_KEY=cff949683de044ba885fa83b1d01b5d07eca5fd47f00afd4
+      - SLSKD_API_KEY=${SLSKD_API_KEY:-}
       - LASTFM_API_KEY=${LASTFM_API_KEY:-}
-      - GENIUS_ACCESS_TOKEN=zwAAVFHM75M1GlOtx1WCcYpfRSQMlx6G7xT0coylZsFwsppx-H1LC6p4vuStzOw8
+      - LASTFM_SECRET=${LASTFM_SECRET:-}
+      - GENIUS_ACCESS_TOKEN=${GENIUS_ACCESS_TOKEN:-}
+      - ORLY_JAMS_URL=http://host.docker.internal:7070
+      - DEPLOY_SECRET=${DEPLOY_SECRET:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /media/sdb:/media/sdb
-      - /DATA/AppData/beets:/DATA/AppData/beets
-      - /DATA/AppData/nas-controller:/DATA/AppData/nas-controller
+      - /media/nas-hdd:/media/nas-hdd
+      - /opt/apps/beets:/DATA/AppData/beets
+      - /opt/apps/nas-controller:/DATA/AppData/nas-controller
+      - /opt/apps/homelab-setup:/DATA/homelab-setup
       - /usr/bin/docker:/usr/bin/docker:ro
-      - /DATA/AppData/navidrome:/DATA/AppData/navidrome
-      - /DATA/homelab-setup:/DATA/homelab-setup
-      - /DATA/.ssh:/DATA/.ssh:ro
+      - /opt/apps/navidrome:/DATA/AppData/navidrome
       - ./data:/data
     dns:
       - 8.8.8.8
@@ -35,7 +38,7 @@ services:
 
   deploy-agent:
     build:
-      context: /DATA/AppData/nas-controller/deploy
+      context: ./deploy
       dockerfile: Dockerfile
     image: deploy-agent:latest
     container_name: deploy-agent
@@ -45,13 +48,12 @@ services:
     environment:
       - DEPLOY_SECRET=${DEPLOY_SECRET:-}
     volumes:
-      - /DATA/homelab-setup:/DATA/homelab-setup
+      - /opt/apps/homelab-setup:/DATA/homelab-setup
       - /var/run/docker.sock:/var/run/docker.sock
-      - /DATA/.ssh:/DATA/.ssh:ro
-      - /DATA/AppData/nas-controller/deploy:/deploy
-      - /DATA/AppData/nas-controller:/DATA/AppData/nas-controller
-      - /DATA/AppData/beets:/DATA/AppData/beets
-      - /DATA/AppData/navidrome:/DATA/AppData/navidrome
+      - /opt/apps/nas-controller/deploy:/deploy
+      - /opt/apps/nas-controller:/DATA/AppData/nas-controller
+      - /opt/apps/beets:/DATA/AppData/beets
+      - /opt/apps/navidrome:/DATA/AppData/navidrome
       - /usr/bin/docker:/usr/bin/docker:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
