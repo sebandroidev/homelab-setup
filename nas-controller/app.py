@@ -3701,6 +3701,53 @@ def handle_callback(cq: dict):
                 f"[{pick['kind']}/{pick['tmdb_id']}]")
         return
 
+    # ── Watchlist callbacks (read-side) ───────────────────────────────────────
+    if data.startswith("wl:filter:"):
+        new_status = data.rsplit(":", 1)[1]
+        s = _wl_session_get(chat_id) or {}
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_handle_watchlist_open,
+                         args=(chat_id, msg_id, new_status, s.get("sort","recent"), 0),
+                         daemon=True).start()
+        return
+
+    if data.startswith("wl:sort:"):
+        new_sort = data.rsplit(":", 1)[1]
+        s = _wl_session_get(chat_id) or {}
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_handle_watchlist_open,
+                         args=(chat_id, msg_id, s.get("status","all"), new_sort,
+                               s.get("page", 0)),
+                         daemon=True).start()
+        return
+
+    if data in ("wl:page:next", "wl:page:prev"):
+        s = _wl_session_get(chat_id)
+        if not s: return
+        delta = 1 if data.endswith("next") else -1
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_handle_watchlist_open,
+                         args=(chat_id, msg_id, s["status"], s["sort"],
+                               s["page"] + delta),
+                         daemon=True).start()
+        return
+
+    if data.startswith("wl:item:"):
+        wid = int(data.rsplit(":", 1)[1])
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_send_watchlist_item,
+                         args=(chat_id, msg_id, wid), daemon=True).start()
+        return
+
+    if data == "wl:back_to_list":
+        s = _wl_session_get(chat_id) or {}
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_handle_watchlist_open,
+                         args=(chat_id, msg_id, s.get("status","all"),
+                               s.get("sort","recent"), s.get("page", 0)),
+                         daemon=True).start()
+        return
+
     if data == "nas:trash:empty:confirm":
         msg_id = cq.get("message", {}).get("message_id")
         threading.Thread(target=_empty_trash_execute, args=(chat_id, msg_id), daemon=True).start()
@@ -5896,23 +5943,273 @@ def _handle_find_url(chat_id: int, url: str):
         except Exception: pass
 
 
+# ── Watcharr client ───────────────────────────────────────────────────────────
+_WL_STATUS_ICONS = {
+    "PLANNED":  "📌",
+    "WATCHING": "👀",
+    "FINISHED": "✅",
+    "HOLD":     "⏸",
+    "DROPPED":  "🚫",
+}
+_WL_STATUS_LABELS = {
+    "PLANNED":  "Planned",
+    "WATCHING": "Watching",
+    "FINISHED": "Watched",
+    "HOLD":     "On hold",
+    "DROPPED":  "Dropped",
+}
+_WL_PAGE_SIZE = 8
+
+
+def _watcharr_request(method: str, path: str, body: dict | None = None,
+                       timeout: int = 15) -> tuple[int, dict | list | None]:
+    """Returns (status_code, parsed_body). Watcharr quirk: auth header is the
+    raw token, no `Bearer ` prefix."""
+    if not WATCHARR_TOKEN:
+        return 0, None
+    url = WATCHARR_URL.rstrip("/") + path
+    headers = {"Authorization": WATCHARR_TOKEN}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            try: return r.status, json.loads(raw) if raw else None
+            except Exception: return r.status, None
+    except urllib.error.HTTPError as e:
+        try: parsed = json.loads(e.read())
+        except Exception: parsed = None
+        log.warning("[wl] %s %s HTTP %d", method, path, e.code)
+        return e.code, parsed
+    except Exception as e:
+        log.warning("[wl] %s %s exception: %s", method, path, e)
+        return 0, None
+
+
+def _wl_normalize(raw: dict) -> dict:
+    c = raw.get("content") or {}
+    date = c.get("release_date") or ""
+    year = int(date[:4]) if date[:4].isdigit() else None
+    poster = c.get("poster_path")
+    kind = c.get("type") or "movie"
+    return {
+        "watched_id":       raw.get("id"),
+        "tmdb_id":          c.get("tmdbId"),
+        "kind":             kind,
+        "title":            c.get("title") or "",
+        "year":             year,
+        "overview":         c.get("overview") or "",
+        "rating":           round(float(c.get("vote_average") or 0), 1),
+        "poster_url":       f"{TMDB_IMG_W500}{poster}" if poster else None,
+        "tmdb_page":        f"https://www.themoviedb.org/{kind}/{c.get('tmdbId')}",
+        "status":           raw.get("status") or "PLANNED",
+        "user_rating":      raw.get("rating") or 0,
+        "created_at":       raw.get("createdAt") or "",
+        "seasons":          c.get("numberOfSeasons") or 0,
+        "episodes":         c.get("numberOfEpisodes") or 0,
+    }
+
+
+def _wl_list() -> list[dict]:
+    code, body = _watcharr_request("GET", "/api/watched")
+    if code != 200 or not isinstance(body, list):
+        return []
+    return [_wl_normalize(r) for r in body]
+
+
+def _render_watchlist(session: dict) -> tuple[str, str]:
+    items = session["items"]
+    status = session["status"]
+    sort   = session["sort"]
+    page   = session["page"]
+    pages  = max(1, (len(items) + _WL_PAGE_SIZE - 1) // _WL_PAGE_SIZE)
+    start  = page * _WL_PAGE_SIZE
+    end    = start + _WL_PAGE_SIZE
+    slice_ = items[start:end]
+
+    head = "📺 *Watchlist*"
+    if status != "all":
+        head += f" — {_WL_STATUS_ICONS[status]} {_WL_STATUS_LABELS[status]}"
+    head += f" · {len(items)} item(s)"
+    if pages > 1:
+        head += f" · page {page+1}/{pages}"
+    sort_lbl = "🕒 Recent" if sort == "recent" else "⭐ Top rated"
+    lines = [head, f"_{sort_lbl}_", ""]
+    if not slice_:
+        lines.append("_No items match this filter._")
+
+    rows = []
+    for it in slice_:
+        icon = "🎬" if it["kind"] == "movie" else "📺"
+        sicon = _WL_STATUS_ICONS.get(it["status"], "·")
+        rating = f"⭐{it['rating']}" if it["rating"] else "—"
+        label = f"{icon} {sicon} {it['title'][:30]} ({it['year'] or '?'}) {rating}"
+        rows.append([{"text": label[:60], "callback_data": f"wl:item:{it['watched_id']}"}])
+
+    # Pagination
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ Prev", "callback_data": "wl:page:prev"})
+    if page + 1 < pages:
+        nav.append({"text": "Next ▶️", "callback_data": "wl:page:next"})
+    if nav:
+        rows.append(nav)
+
+    # Filter row
+    filters = ("all", "PLANNED", "WATCHING", "FINISHED")
+    filter_row = []
+    for f in filters:
+        sel = "•" if f == status else " "
+        lbl = ("📋 All" if f == "all"
+               else f"{_WL_STATUS_ICONS[f]} {_WL_STATUS_LABELS[f]}")
+        filter_row.append({"text": f"{sel} {lbl}", "callback_data": f"wl:filter:{f}"})
+    # Telegram inline kb max 8 cols per row — split into 2 rows of 2
+    rows.append(filter_row[:2])
+    rows.append(filter_row[2:])
+
+    # Sort toggle
+    other = "rated" if sort == "recent" else "recent"
+    other_lbl = "⭐ Top rated" if other == "rated" else "🕒 Recent"
+    rows.append([{"text": f"Sort: {other_lbl}", "callback_data": f"wl:sort:{other}"}])
+
+    return "\n".join(lines), _inline(rows)
+
+
+def _render_watchlist_item(it: dict) -> tuple[str, str | None, str]:
+    kind_label = "🎬 Movie" if it["kind"] == "movie" else "📺 TV Show"
+    rating = f"⭐ {it['rating']}/10" if it["rating"] else "_no rating_"
+    sicon = _WL_STATUS_ICONS.get(it["status"], "·")
+    slabel = _WL_STATUS_LABELS.get(it["status"], it["status"])
+    overview = it["overview"][:500]
+    if len(it["overview"]) > 500:
+        overview = overview.rstrip() + "…"
+    lines = [
+        f"*{_esc(it['title'])}* ({it['year'] or '????'})",
+        f"{kind_label}  ·  {rating}",
+        "",
+        _esc(overview) if overview else "_no overview_",
+        "",
+        f"Status: {sicon} {slabel}",
+    ]
+    if it["kind"] == "tv" and it["seasons"]:
+        lines.append(f"📋 {it['seasons']} season(s) · {it['episodes']} episode(s)")
+
+    wid = it["watched_id"]
+    rows = []
+    if it["status"] != "WATCHING":
+        rows.append([{"text": "👀 Mark Watching",
+                       "callback_data": f"wl:status:{wid}:WATCHING"}])
+    if it["status"] != "FINISHED":
+        rows.append([{"text": "✅ Mark Watched",
+                       "callback_data": f"wl:status:{wid}:FINISHED"}])
+    if it["status"] != "PLANNED":
+        rows.append([{"text": "📌 Mark Planned",
+                       "callback_data": f"wl:status:{wid}:PLANNED"}])
+    if it["kind"] == "tv" and it["seasons"]:
+        rows.append([{"text": "📋 Episodes",
+                       "callback_data": f"wl:episodes:{wid}"}])
+    rows.append([{"text": "🗑 Remove",       "callback_data": f"wl:remove:{wid}"}])
+    rows.append([{"text": "🔗 Open TMDB",    "url": it["tmdb_page"]}])
+    rows.append([{"text": "◀️ Back to list", "callback_data": "wl:back_to_list"}])
+    return "\n".join(lines), it.get("poster_url"), _inline(rows)
+
+
+def _wl_session_set(chat_id: int, session: dict):
+    session["expires_at"] = time.time() + FIND_SESSION_TTL
+    with _wl_lock:
+        _wl_session[chat_id] = session
+
+
+def _wl_session_get(chat_id: int) -> dict | None:
+    with _wl_lock:
+        s = _wl_session.get(chat_id)
+        if not s: return None
+        if time.time() > s.get("expires_at", 0):
+            _wl_session.pop(chat_id, None); return None
+        return s
+
+
+def _wl_sort_items(items: list, sort: str) -> list:
+    if sort == "rated":
+        return sorted(items, key=lambda x: (-x["rating"], x["title"]))
+    return sorted(items, key=lambda x: (x["created_at"] or "", x["title"]), reverse=True)
+
+
 def _handle_watchlist_open(chat_id: int, msg_id: int | None = None,
                             status: str = "all", sort: str = "recent", page: int = 0):
-    """Watchlist browser stub — full implementation lands in commit 5."""
     if not WATCHARR_TOKEN:
         text = ("⚠️ `WATCHARR_TOKEN` not configured.\n\n"
                 "1. Open https://watchlist.bastienlab.com\n"
                 "2. Sign up the admin account\n"
-                "3. Settings → Tokens → Create read+write token\n"
-                "4. Add to /opt/apps/nas-controller/.env as `WATCHARR_TOKEN=...`\n"
-                "5. Restart the container")
-        if msg_id:
-            tg_edit(chat_id, msg_id, text)
-        else:
-            tg_send(chat_id, text)
+                "3. Watcharr uses login JWT for auth — see watcharr/README.md")
+        if msg_id: tg_edit(chat_id, msg_id, text)
+        else:      tg_send(chat_id, text)
         return
-    tg_send(chat_id, "🚧 Watchlist browser lands in commit 5.",
-            reply_markup=TG_MEDIA_KB)
+
+    placeholder = "📺 Loading watchlist…"
+    if msg_id is None:
+        res = tg_send(chat_id, placeholder)
+        msg_id = (res or {}).get("result", {}).get("message_id")
+    else:
+        tg_edit(chat_id, msg_id, placeholder)
+
+    raw = _wl_list()
+    if status != "all":
+        raw = [x for x in raw if x["status"] == status]
+    raw = _wl_sort_items(raw, sort)
+    pages = max(1, (len(raw) + _WL_PAGE_SIZE - 1) // _WL_PAGE_SIZE)
+    page  = max(0, min(page, pages - 1))
+
+    session = {
+        "chat_id": chat_id,
+        "msg_id":  msg_id,
+        "status":  status,
+        "sort":    sort,
+        "page":    page,
+        "items":   raw,
+        "total":   len(raw),
+    }
+    _wl_session_set(chat_id, session)
+    text, kb = _render_watchlist(session)
+    try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+    except Exception:
+        # If we previously sent a photo card, deleteMessage + send fresh
+        try: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        except Exception: pass
+        res = tg_send(chat_id, text, reply_markup=kb)
+        new_id = (res or {}).get("result", {}).get("message_id")
+        if new_id:
+            session["msg_id"] = new_id
+            _wl_session_set(chat_id, session)
+
+
+def _send_watchlist_item(chat_id: int, msg_id: int, watched_id: int):
+    s = _wl_session_get(chat_id)
+    items = (s or {}).get("items", [])
+    item  = next((x for x in items if x["watched_id"] == watched_id), None)
+    if not item:
+        # Refresh from server
+        all_items = _wl_list()
+        item = next((x for x in all_items if x["watched_id"] == watched_id), None)
+    if not item:
+        tg_edit(chat_id, msg_id, "❌ Item not found (may have been removed)."); return
+    text, poster, kb = _render_watchlist_item(item)
+    # Try to replace text msg with photo card by deleteMessage + sendPhoto
+    try: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+    except Exception: pass
+    if poster:
+        res = _tg_call("sendPhoto", chat_id=chat_id, photo=poster,
+                       caption=text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        res = tg_send(chat_id, text, reply_markup=kb)
+    new_id = (res or {}).get("result", {}).get("message_id")
+    if new_id and s:
+        s["msg_id"] = new_id
+        s["viewing_item"] = watched_id
+        _wl_session_set(chat_id, s)
 
 
 if __name__ == "__main__":
