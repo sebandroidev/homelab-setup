@@ -5079,24 +5079,44 @@ def _list_orphans() -> dict[str, list[str]]:
     return orphans
 
 
-def _reconcile_orphans(silent: bool = False, chat_id: int | None = None) -> int:
+def _beets_item_count() -> int:
+    """Snapshot the items count for delta computation."""
+    if not BEETS_DB.exists():
+        return 0
+    try:
+        con = sqlite3.connect(f"file:{BEETS_DB}?mode=ro", uri=True)
+        n = con.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        con.close()
+        return n
+    except Exception:
+        return 0
+
+
+def _reconcile_orphans(silent: bool = False, chat_id: int | None = None,
+                        daemon: bool = False) -> int:
     """Import every disk file not in beets, one directory at a time, with --noautotag.
-    Returns the count of newly-imported files. Hold _pipeline_lock externally
-    when calling from a flow that already owns it (e.g. Library Sync); the
-    background daemon and manual NAS Control invocation acquire it themselves."""
+    Returns the *actual* number of new beets items (DB delta), not the orphan
+    count — beets often skips "already in library" duplicates with returncode=0,
+    so trusting the return code falsely inflated the count.
+
+    silent=True   → never Telegrams (used by Library Sync, which has its own UI)
+    daemon=True   → silent if no real growth; chatters only on actual imports.
+                    Use this for the 6h background loop.
+    chat_id given → reply to that specific chat (manual button); always
+                    reports honestly, including 0 imports + dedup hint."""
     orphans = _list_orphans()
     if not orphans:
         log.info("[reconcile] no orphans")
-        if not silent and chat_id:
+        if not silent and chat_id and not daemon:
             try: tg_send(chat_id, "📥 No orphans — library matches disk.")
             except Exception: pass
         return 0
     total_files = sum(len(v) for v in orphans.values())
     log.info("[reconcile] %d orphan files across %d dirs", total_files, len(orphans))
-    imported = 0
+
+    before = _beets_item_count()
     failed_dirs: list[str] = []
     for host_dir in orphans:
-        # Translate host dir to container view for beets
         container_dir = host_dir
         for host, container in BEETS_DIR_MAP.items():
             if host_dir == host or host_dir.startswith(host + "/"):
@@ -5107,30 +5127,48 @@ def _reconcile_orphans(silent: bool = False, chat_id: int | None = None) -> int:
                 ["docker", "exec", "beets", "beet", "import", "-q",
                  "--noautotag", container_dir],
                 capture_output=True, text=True, timeout=1800)
-            if r.returncode == 0:
-                imported += len(orphans[host_dir])
-            else:
+            if r.returncode != 0:
                 failed_dirs.append(host_dir)
                 log.warning("[reconcile] import failed for %s: %s",
                             host_dir, (r.stderr or r.stdout)[:200])
         except Exception as e:
             failed_dirs.append(host_dir)
             log.warning("[reconcile] import exec failed for %s: %s", host_dir, e)
-    log.info("[reconcile] imported=%d failed_dirs=%d", imported, len(failed_dirs))
-    if not silent:
-        head = "\n".join(f"  • {Path(d).name}: {len(orphans[d])} track(s)"
-                         for d in list(orphans)[:8])
-        more = f"\n…and {len(orphans)-8} more dir(s)" if len(orphans) > 8 else ""
-        tail = f"\n⚠️ {len(failed_dirs)} dir(s) failed" if failed_dirs else ""
-        msg = (f"📥 *Reconciled {imported}* new track(s) from {len(orphans)} dir(s):\n"
-               f"{head}{more}{tail}")
-        if chat_id:
-            try: tg_send(chat_id, msg)
+
+    after = _beets_item_count()
+    imported = max(0, after - before)
+    skipped  = total_files - imported
+    log.info("[reconcile] db delta: %d → %d (imported=%d, skipped=%d, failed_dirs=%d)",
+             before, after, imported, skipped, len(failed_dirs))
+
+    if silent:
+        return imported
+    if daemon and imported == 0:
+        # Background loop stays quiet when nothing changed (e.g. all orphans
+        # are duplicate paths of already-imported items).
+        return imported
+
+    head = "\n".join(f"  • {Path(d).name}: {len(orphans[d])} track(s)"
+                     for d in list(orphans)[:8])
+    more = f"\n…and {len(orphans)-8} more dir(s)" if len(orphans) > 8 else ""
+    tail = f"\n⚠️ {len(failed_dirs)} dir(s) failed" if failed_dirs else ""
+
+    if imported > 0:
+        msg = (f"📥 *Imported {imported}* new track(s) from {len(orphans)} dir(s):"
+               f"\n{head}{more}{tail}")
+    else:
+        msg = (f"🪞 *No new imports.* All {total_files} disk file(s) across "
+               f"{len(orphans)} dir(s) are already in beets under a different "
+               f"path — looks like leftover copies from an earlier `copy: yes` "
+               f"import.\n\nTap 🔌 *NAS Control* → 🧹 *Dedup duplicates* to "
+               f"soft-trash them and free disk space.{tail}")
+    if chat_id:
+        try: tg_send(chat_id, msg)
+        except Exception: pass
+    elif not daemon:
+        for cid in ALLOWED_IDS:
+            try: tg_send(cid, msg)
             except Exception: pass
-        else:
-            for cid in ALLOWED_IDS:
-                try: tg_send(cid, msg)
-                except Exception: pass
     return imported
 
 
@@ -5286,12 +5324,22 @@ def _dedup_orphans(chat_id: int | None = None, msg_id: int | None = None):
 
 
 def _orphan_reconcile_loop():
-    """Background daemon: every 6h scan disk vs beets, auto-import any new files."""
+    """Background daemon: every 6h scan disk vs beets, auto-import any new files.
+    Stays silent on the Telegram side unless the DB actually grew — see
+    _reconcile_orphans(daemon=True)."""
     # Initial delay so we don't race with startup
     time.sleep(300)
     while True:
         try:
-            _reconcile_orphans_with_lock(chat_id=None)
+            if _pipeline_lock.acquire(blocking=False):
+                try:
+                    imported = _reconcile_orphans(silent=False, chat_id=None,
+                                                    daemon=True)
+                    if imported:
+                        try: _nav_request("startScan")
+                        except Exception: pass
+                finally:
+                    _pipeline_lock.release()
         except Exception as e:
             log.warning("[reconcile] loop error: %s", e)
         time.sleep(ORPHAN_RECONCILE_INTERVAL)
