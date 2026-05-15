@@ -5493,6 +5493,156 @@ def _gemini_text_pass(meta: dict) -> dict | None:
         return None
 
 
+_YOUTUBE_DOMAINS = ("youtube.com", "youtu.be", "m.youtube.com", "www.youtube.com")
+
+
+def _is_youtube_url(url: str) -> bool:
+    try:
+        return urllib.parse.urlparse(url).netloc in _YOUTUBE_DOMAINS
+    except Exception:
+        return False
+
+
+def _ytdlp_download(url: str, dst: Path) -> Path | None:
+    """Download the smallest acceptable video stream, capped at GEMINI_VIDEO_MAX_MB."""
+    try:
+        r = subprocess.run(
+            ["python3", "-m", "yt_dlp",
+             "-f", f"best[filesize<{GEMINI_VIDEO_MAX_MB}M]/worst",
+             "--max-filesize", f"{GEMINI_VIDEO_MAX_MB}M",
+             "--no-playlist", "--no-warnings", "--quiet",
+             "--socket-timeout", "20",
+             "-o", str(dst),
+             url],
+            capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            log.warning("[find] yt-dlp download failed (%d): %s",
+                        r.returncode, r.stderr[:200])
+            return None
+    except Exception as e:
+        log.warning("[find] yt-dlp download exception: %s", e)
+        return None
+    # yt-dlp may have written the file under a different extension; resolve glob
+    matches = list(dst.parent.glob(dst.stem + ".*"))
+    return matches[0] if matches else None
+
+
+def _gemini_upload_file(path: Path, mime: str = "video/mp4") -> str | None:
+    """Upload a local file via Gemini Files API resumable protocol.
+    Returns the fileUri usable in subsequent generateContent calls, or None."""
+    if not GEMINI_API_KEY or not path.exists():
+        return None
+    size = path.stat().st_size
+    display = path.name[:60]
+    # Phase 1 — initiate
+    try:
+        init_body = json.dumps({"file": {"display_name": display}}).encode()
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/files",
+            data=init_body,
+            method="POST",
+            headers={
+                "x-goog-api-key": GEMINI_API_KEY,
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(size),
+                "X-Goog-Upload-Header-Content-Type": mime,
+                "Content-Type": "application/json",
+            })
+        with urllib.request.urlopen(req, timeout=30) as r:
+            upload_url = r.headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            log.warning("[find] Gemini upload init missing X-Goog-Upload-URL")
+            return None
+    except Exception as e:
+        log.warning("[find] Gemini upload init failed: %s", e); return None
+    # Phase 2 — upload bytes
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        req = urllib.request.Request(
+            upload_url, data=data, method="POST",
+            headers={
+                "Content-Length": str(size),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            })
+        with urllib.request.urlopen(req, timeout=180) as r:
+            meta = json.loads(r.read())
+    except Exception as e:
+        log.warning("[find] Gemini upload bytes failed: %s", e); return None
+    f_info = meta.get("file") or {}
+    name   = f_info.get("name") or ""
+    uri    = f_info.get("uri") or ""
+    # Phase 3 — wait until ACTIVE (videos take seconds to process)
+    if name:
+        for _ in range(30):
+            time.sleep(2)
+            try:
+                req = urllib.request.Request(
+                    f"{GEMINI_BASE}/{name}",
+                    headers={"x-goog-api-key": GEMINI_API_KEY})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    info = json.loads(r.read())
+            except Exception:
+                continue
+            state = info.get("state", "")
+            if state == "ACTIVE":
+                log.info("[find] Gemini file ACTIVE: %s", name); return uri
+            if state == "FAILED":
+                log.warning("[find] Gemini file FAILED: %s", name); return None
+        log.warning("[find] Gemini file still processing after 60s: %s", name)
+    return uri or None
+
+
+def _gemini_video_pass(file_uri: str, mime: str = "video/mp4") -> dict | None:
+    """Multimodal Gemini call: identify movie/TV show from the actual video."""
+    if not GEMINI_API_KEY or not file_uri:
+        return None
+    prompt = (
+        "Identify the movie or TV show shown in this video clip.\n\n"
+        "Respond with JSON in this exact schema:\n"
+        "{\n"
+        '  "kind": "movie" | "tv" | "unknown",\n'
+        '  "title": "string (canonical title)",\n'
+        '  "year": integer or null,\n'
+        '  "confidence": number 0.0-1.0,\n'
+        '  "reasoning": "one short sentence"\n'
+        "}"
+    )
+    body = {
+        "contents": [{"parts": [
+            {"fileData": {"fileUri": file_uri, "mimeType": mime}},
+            {"text": prompt},
+        ]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+    }
+    try:
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent",
+            data=json.dumps(body).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": GEMINI_API_KEY})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        log.warning("[find] Gemini video HTTP %d: %s", e.code, e.read()[:200])
+        return None
+    except Exception as e:
+        log.warning("[find] Gemini video exception: %s", e)
+        return None
+    try:
+        txt = res["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(txt)
+        log.info("[find] Gemini video: kind=%s title=%r year=%s conf=%.2f",
+                 parsed.get("kind"), parsed.get("title"),
+                 parsed.get("year"), parsed.get("confidence", 0))
+        return parsed
+    except Exception as e:
+        log.warning("[find] Gemini video parse failed: %s", e); return None
+
+
 def _tmdb_request(path: str, **params) -> dict | None:
     if not TMDB_API_KEY:
         return None
@@ -5671,14 +5821,47 @@ def _handle_find_url(chat_id: int, url: str):
     year = gemini.get("year")
 
     if kind == "unknown" or not title or conf < FIND_CONFIDENCE_ESCALATE:
-        # Video escalation lands in commit 4. For now, surface what we got.
-        tg_edit(chat_id, msg_id,
-                f"🤷 Gemini couldn't identify the media confidently "
-                f"(confidence {conf:.0%}).\n\n"
-                f"Best guess: _{_esc(title or '?')} ({year or '?'})_\n"
-                f"Reasoning: _{_esc(gemini.get('reasoning',''))[:200]}_\n\n"
-                "_Video escalation lands in commit 4._")
-        return
+        # Stage 2: video escalation — feed the actual frames+audio to Gemini.
+        if _is_youtube_url(url):
+            tg_edit(chat_id, msg_id,
+                    "🎞 Low confidence from metadata — asking Gemini to watch the YouTube video…")
+            video = _gemini_video_pass(url, mime="video/*")
+        else:
+            tg_edit(chat_id, msg_id,
+                    f"🎞 Low confidence from metadata — downloading the clip "
+                    f"(≤{GEMINI_VIDEO_MAX_MB} MB)…")
+            tmpdir = Path("/tmp/find_dl")
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            dst = tmpdir / f"{uuid.uuid4().hex[:10]}.mp4"
+            path = _ytdlp_download(url, dst)
+            if not path or not path.exists():
+                tg_edit(chat_id, msg_id,
+                        "❌ Couldn't download the clip (too large, unsupported site, or geo-blocked).")
+                return
+            try:
+                tg_edit(chat_id, msg_id, "📤 Uploading to Gemini Files API…")
+                file_uri = _gemini_upload_file(path)
+                if not file_uri:
+                    tg_edit(chat_id, msg_id, "❌ Gemini Files API upload failed.")
+                    return
+                tg_edit(chat_id, msg_id, "🤖 Asking Gemini to watch the clip…")
+                video = _gemini_video_pass(file_uri)
+            finally:
+                try: path.unlink()
+                except Exception: pass
+        if not video:
+            tg_edit(chat_id, msg_id,
+                    "❌ Video pass failed (rate limit? upload error?). Check logs.")
+            return
+        gemini = video  # override the weak text-pass result
+        kind, title, conf, year = (video.get("kind"), video.get("title"),
+                                    float(video.get("confidence") or 0),
+                                    video.get("year"))
+        if kind == "unknown" or not title:
+            tg_edit(chat_id, msg_id,
+                    f"🤷 Gemini still couldn't identify the media after watching "
+                    f"the clip.\n\nReasoning: _{_esc(video.get('reasoning',''))[:200]}_")
+            return
 
     # Stage 3: TMDB search
     tg_edit(chat_id, msg_id, f"🔎 Searching TMDB for *{_esc(title)}*…")
