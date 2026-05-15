@@ -181,7 +181,8 @@ _del_session: dict = {}         # chat_id -> session dict
 _del_lock     = threading.Lock()
 
 # Find Infos + Watchlist state
-_find_pending: set = set()      # chat_ids awaiting video URL
+_find_pending:        set = set()      # chat_ids awaiting video URL
+_find_refine_pending: set = set()      # chat_ids awaiting refined title text
 _find_session: dict = {}        # chat_id -> {url, candidates, picked, gemini, expires_at, msg_id}
 _wl_session:   dict = {}        # chat_id -> {status, sort, page, items, total, expires_at, msg_id}
 _find_lock     = threading.Lock()
@@ -3675,6 +3676,15 @@ def handle_callback(cq: dict):
         _find_session_set(chat_id, s)
         return
 
+    if data == "find:refine":
+        msg_id = cq.get("message", {}).get("message_id")
+        _find_refine_pending.add(chat_id)
+        tg_send(chat_id,
+                "🔁 *Search by different title*\n\n"
+                "Send the correct title (e.g. `Yoh! Bestie` or `Yoh! Bestie 2026`). "
+                "I'll look it up on IMDb and TMDB.")
+        return
+
     if data == "find:back_to_picker":
         s = _find_session_get(chat_id)
         if not s: return
@@ -4250,6 +4260,12 @@ def handle_tg(chat_id, text):
     if chat_id in _find_pending:
         _find_pending.discard(chat_id)
         threading.Thread(target=_handle_find_url, args=(chat_id, text), daemon=True).start()
+        return
+
+    # If chat is awaiting a refined title (manual override after wrong Gemini guess)
+    if chat_id in _find_refine_pending:
+        _find_refine_pending.discard(chat_id)
+        threading.Thread(target=_handle_find_refine, args=(chat_id, text), daemon=True).start()
         return
 
     tg_send(chat_id, "Tap a button below.", reply_markup=TG_KEYBOARD)
@@ -5590,10 +5606,20 @@ def _gemini_text_pass(meta: dict) -> dict | None:
         "movie or TV show featured in the video. The video is likely a fan edit, "
         "trailer, scene compilation, or reaction.\n\n"
         f"METADATA:\n```json\n{json.dumps(meta, ensure_ascii=False)[:3000]}\n```\n\n"
+        "IMPORTANT title rules:\n"
+        "- Preserve the *complete* canonical title verbatim — including all words, "
+        "articles, and unusual punctuation. Do NOT drop interjections, exclamation "
+        "marks, or prefixes that look like greetings.\n"
+        "- Examples of titles to keep intact: 'Yoh! Bestie' (keep 'Yoh!'), "
+        "'Oh, Brother', 'Mr. Robot', '¡Three Amigos!', 'Mrs. Doubtfire'.\n"
+        "- Strip caption noise that is NOT part of the title (e.g. 'now playing on "
+        "Netflix', emoji, hashtags, '#movie', uploader handles).\n"
+        "- If the metadata explicitly quotes the title or the upload comes from an "
+        "official studio/streamer account, trust that wording.\n\n"
         "Respond with JSON in this exact schema:\n"
         "{\n"
         '  "kind": "movie" | "tv" | "unknown",\n'
-        '  "title": "string (best guess at the canonical title)",\n'
+        '  "title": "string (canonical title verbatim, no caption noise)",\n'
         '  "year": integer or null,\n'
         '  "confidence": number from 0.0 to 1.0,\n'
         '  "reasoning": "one short sentence"\n'
@@ -5844,31 +5870,56 @@ def _omdb_normalize(raw: dict, fallback_kind: str = "movie") -> dict:
 
 
 def _omdb_search(title: str, year: int | None, kind: str) -> list[dict]:
-    """Title-based OMDb lookup. Returns 0..3 candidates."""
+    """OMDb lookup returning up to 5 candidates.
+
+    Strategy: query both endpoints in parallel —
+      • ?t=...  → single exact-title match (best primary signal)
+      • ?s=...  → 1..10 fuzzy search results (catches close-but-not-exact)
+    Merge: exact-t match first if present, then s= results that don't duplicate it.
+    Each s= hit is enriched via a follow-up ?i= call to get plot + rating.
+    """
     if not title or not OMDB_API_KEY:
         return []
     omdb_type = "series" if kind == "tv" else ("movie" if kind == "movie" else "")
-    # Try the precise t= lookup first (single best match)
-    params = {"t": title}
-    if year:
-        params["y"] = year
-    if omdb_type:
-        params["type"] = omdb_type
-    primary = _omdb_request(**params)
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # 1) Exact-title try (with year + type filters when known)
+    t_params: dict = {"t": title}
+    if year: t_params["y"] = year
+    if omdb_type: t_params["type"] = omdb_type
+    primary = _omdb_request(**t_params)
     if primary:
-        return [_omdb_normalize(primary, fallback_kind=kind)]
-    # Drop year filter and retry once before giving up
-    if year:
-        params.pop("y", None)
-        primary = _omdb_request(**params)
+        c = _omdb_normalize(primary, fallback_kind=kind)
+        if c["imdb_id"]:
+            seen_ids.add(c["imdb_id"])
+            out.append(c)
+
+    # 2) Broad search — drops the year filter for wider net
+    s_params: dict = {"s": title}
+    if omdb_type:
+        s_params["type"] = omdb_type
+    search = _omdb_request(**s_params)
+    raw_hits = (search or {}).get("Search") or []
+    for hit in raw_hits[:5]:
+        iid = hit.get("imdbID") or ""
+        if not iid or iid in seen_ids:
+            continue
+        seen_ids.add(iid)
+        # Enrich with full details so the card has plot + rating
+        full = _omdb_request(i=iid)
+        out.append(_omdb_normalize(full or hit, fallback_kind=kind))
+        if len(out) >= 5:
+            break
+
+    if out:
+        return out
+
+    # 3) Last-resort: precise t= without filters
+    if year or omdb_type:
+        primary = _omdb_request(t=title)
         if primary:
             return [_omdb_normalize(primary, fallback_kind=kind)]
-    # Drop type filter as last resort
-    if omdb_type:
-        params.pop("type", None)
-        primary = _omdb_request(**params)
-        if primary:
-            return [_omdb_normalize(primary)]
     return []
 
 
@@ -6007,6 +6058,7 @@ def _render_find_info(candidate: dict, source_url: str = "",
     rows = [[{"text": "➕ Add to watchlist", "callback_data": "find:add"}]]
     if show_pick_again:
         rows.append([{"text": "🔍 Wrong match? Pick another", "callback_data": "find:back_to_picker"}])
+    rows.append([{"text": "🔁 Search by different title", "callback_data": "find:refine"}])
     link_row = []
     if candidate.get("imdb_page"):
         link_row.append({"text": "🔗 IMDb", "url": candidate["imdb_page"]})
@@ -6034,6 +6086,7 @@ def _render_find_picker(session: dict) -> tuple[str, str]:
         icon = "🎬" if c["kind"] == "movie" else "📺"
         label = f"{i+1}. {icon} {c['title'][:35]} ({c['year'] or '?'})"
         rows.append([{"text": label[:60], "callback_data": f"find:pick:{i}"}])
+    rows.append([{"text": "🔁 Search by different title", "callback_data": "find:refine"}])
     rows.append([{"text": "❌ Cancel", "callback_data": "find:cancel"}])
     return "\n".join(lines), _inline(rows)
 
@@ -6053,6 +6106,54 @@ def _send_or_edit_info_card(chat_id: int, candidate: dict, source_url: str,
         res = _tg_call("sendMessage", chat_id=chat_id, text=caption,
                        parse_mode="Markdown", reply_markup=kb)
     return (res or {}).get("result", {}).get("message_id")
+
+
+def _handle_find_refine(chat_id: int, query: str):
+    """Re-run identity lookup on a user-supplied title (skips Gemini)."""
+    query = (query or "").strip()
+    if not query:
+        tg_send(chat_id, "Empty query. Tap 🔍 Find Infos to retry.",
+                reply_markup=TG_MEDIA_KB)
+        return
+    placeholder = tg_send(chat_id, f"🔎 Searching IMDb for *{_esc(query)}*…")
+    msg_id = (placeholder or {}).get("result", {}).get("message_id")
+
+    # Detect kind heuristically from existing session
+    s = _find_session_get(chat_id) or {}
+    prior = (s.get("gemini") or {}).get("kind") or "movie"
+    kind  = prior if prior in ("movie", "tv") else "movie"
+
+    candidates = _omdb_search(query, None, kind)
+    if not candidates:
+        tg_edit(chat_id, msg_id, f"🔎 Not on IMDb — trying TMDB for *{_esc(query)}*…")
+        candidates = _tmdb_search(kind, query, None)
+    if not candidates:
+        tg_edit(chat_id, msg_id, f"🤷 No match for `{_esc(query)}` on IMDb or TMDB.")
+        return
+
+    new_session = {
+        "chat_id":    chat_id,
+        "url":        s.get("url", ""),
+        "gemini":     {"title": query, "kind": kind, "confidence": 1.0,
+                       "reasoning": "user-supplied title"},
+        "candidates": candidates,
+        "picked":     0,
+        "msg_id":     msg_id,
+    }
+    _find_session_set(chat_id, new_session)
+
+    if len(candidates) == 1:
+        new_msg_id = _send_or_edit_info_card(chat_id, candidates[0],
+                                              s.get("url",""),
+                                              show_pick_again=False,
+                                              old_msg_id=msg_id)
+        if new_msg_id:
+            new_session["msg_id"] = new_msg_id
+            _find_session_set(chat_id, new_session)
+    else:
+        text, kb = _render_find_picker(new_session)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
 
 
 def _handle_find_url(chat_id: int, url: str):
