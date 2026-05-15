@@ -735,7 +735,8 @@ def _nas_control_menu_kb():
     rows = [[{"text": a["label"], "callback_data": f"nas:{key}"}]
             for key, a in _NAS_ACTIONS.items()]
     rows.append([{"text": "📥 Reconcile orphans", "callback_data": "nas:reconcile"}])
-    rows.append([{"text": "🧹 Empty trash", "callback_data": "nas:trash:empty"}])
+    rows.append([{"text": "🧹 Dedup duplicates",  "callback_data": "nas:dedup"}])
+    rows.append([{"text": "🧹 Empty trash",       "callback_data": "nas:trash:empty"}])
     rows.append([{"text": "❌ Close", "callback_data": "nas:cancel"}])
     return _inline(rows)
 
@@ -3619,6 +3620,12 @@ def handle_callback(cq: dict):
                          args=(chat_id, msg_id), daemon=True).start()
         return
 
+    if data == "nas:dedup":
+        msg_id = cq.get("message", {}).get("message_id")
+        tg_edit(chat_id, msg_id, "🔍 Scanning for duplicate orphans…")
+        threading.Thread(target=_dedup_orphans, args=(chat_id, msg_id), daemon=True).start()
+        return
+
     if data == "nas:trash:empty":
         msg_id = cq.get("message", {}).get("message_id")
         threading.Thread(target=_empty_trash_preview, args=(chat_id, msg_id), daemon=True).start()
@@ -4777,8 +4784,9 @@ def _run_undo(chat_id, msg_id, trash_id):
                     shutil.move(lrc_src, lrc_dst)
             except Exception as e:
                 failures.append(f"{it.get('src','?')}: {e}")
-        # Re-register restored files with beets
-        for d in restored_dirs:
+        # Re-register restored files with beets (skip for dedup — twins already in DB)
+        skip_beet_import = entry.get("kind") == "dedup"
+        for d in (restored_dirs if not skip_beet_import else ()):
             try:
                 subprocess.run(
                     ["docker", "exec", "beets", "beet", "import", "-q",
@@ -4901,6 +4909,138 @@ def _reconcile_orphans_with_lock(chat_id: int | None = None, msg_id: int | None 
         if imported:
             try: _nav_request("startScan")
             except Exception: pass
+    finally:
+        _pipeline_lock.release()
+
+
+def _find_orphan_twin(orphan_path: str, known_rel: set) -> str | None:
+    """Locate a beets-managed twin of an orphan file: same artist dir, same
+    filename, different album dir, AND registered in the beets DB."""
+    op = Path(orphan_path)
+    if len(op.parts) < 3:
+        return None
+    artist_dir   = op.parent.parent
+    orphan_album = op.parent.name
+    filename     = op.name
+    if not artist_dir.is_dir():
+        return None
+    for sibling in artist_dir.iterdir():
+        if not sibling.is_dir() or sibling.name == orphan_album:
+            continue
+        candidate = sibling / filename
+        if not candidate.exists():
+            continue
+        for root in BEETS_DIR_MAP:
+            try:
+                rel = str(candidate.relative_to(root))
+                if rel in known_rel:
+                    return str(candidate)
+            except ValueError:
+                continue
+    return None
+
+
+def _dedup_orphans(chat_id: int | None = None, msg_id: int | None = None):
+    """Find orphan files that have a verifiable beets-managed twin (same artist
+    dir, same filename, same byte size) and soft-trash them. Uses the existing
+    .trash/ journal so the dedup is undoable for TRASH_RETENTION_DAYS."""
+    orphans = _list_orphans()
+    total_files = sum(len(v) for v in orphans.values())
+    if not orphans:
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, "📭 No orphans on disk.")
+        return
+
+    known_rel  = _beets_known_relpaths()
+    twinned    = []      # (orphan, twin)
+    no_twin    = 0
+    size_mism  = 0
+    for files in orphans.values():
+        for f in files:
+            twin = _find_orphan_twin(f, known_rel)
+            if not twin:
+                no_twin += 1; continue
+            try:
+                osize = os.path.getsize(f); tsize = os.path.getsize(twin)
+            except OSError:
+                no_twin += 1; continue
+            if osize == tsize:
+                twinned.append((f, twin))
+            else:
+                size_mism += 1
+
+    if not twinned:
+        msg = (f"🔍 Scanned {total_files} orphan(s) but found no verifiable twins.\n"
+               f"⚠️ {no_twin} without twin · {size_mism} with size mismatch")
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, msg)
+        elif chat_id:
+            tg_send(chat_id, msg)
+        return
+
+    if not _pipeline_lock.acquire(blocking=False):
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, "⚠️ Pipeline busy — try again later.")
+        return
+    try:
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, f"⏳ Trashing {len(twinned)} duplicate(s)…")
+
+        trash_id       = uuid.uuid4().hex[:8]
+        trash_date     = datetime.now().strftime("%Y-%m-%d")
+        trash_root_day = TRASH_ROOT / trash_date
+        moved          = []
+        for orphan, twin in twinned:
+            try:
+                item = {
+                    "host_path": orphan,
+                    "id":        0,
+                    "album_id":  0,
+                    "size":      os.path.getsize(orphan),
+                    "artist":    "(dedup)",
+                    "title":     Path(orphan).name,
+                    "album":     Path(orphan).parent.name,
+                }
+                e = _trash_move_one(item, trash_root_day)
+                e["twin"] = twin
+                moved.append(e)
+            except Exception as exc:
+                log.warning("[dedup] move failed for %s: %s", orphan, exc)
+        moved_dirs = _trash_move_empty_dirs(
+            [{"host_path": o} for o, _ in twinned], trash_root_day)
+
+        now = datetime.now()
+        entry = {
+            "trash_id":    trash_id,
+            "trashed_at":  now.isoformat(timespec="seconds"),
+            "purge_at":    (now + timedelta(days=TRASH_RETENTION_DAYS)).isoformat(timespec="seconds"),
+            "chat_id":     chat_id or 0,
+            "total_bytes": sum(m["size_bytes"] for m in moved),
+            "items":       moved,
+            "moved_dirs":  moved_dirs,
+            "kind":        "dedup",
+        }
+        with _trash_lock:
+            _trash["entries"][trash_id] = entry
+        _save_trash()
+
+        kb = _inline([[{"text": f"↩️ Undo ({TRASH_RETENTION_DAYS}d 0h)",
+                       "callback_data": f"trash:undo:{trash_id}"}]])
+        lines = [f"🧹 *Dedup complete* — {len(moved)} duplicate(s) trashed",
+                 f"💾 Freed: {_human_size(entry['total_bytes'])}"]
+        if no_twin:
+            lines.append(f"⚠️ {no_twin} orphan(s) had no twin — kept")
+        if size_mism:
+            lines.append(f"⚠️ {size_mism} size mismatch — kept")
+        text = "\n".join(lines)
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        elif chat_id:
+            tg_send(chat_id, text, reply_markup=kb)
+        else:
+            for cid in ALLOWED_IDS:
+                try: tg_send(cid, text, reply_markup=kb)
+                except Exception: pass
     finally:
         _pipeline_lock.release()
 
