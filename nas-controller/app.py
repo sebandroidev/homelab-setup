@@ -5125,7 +5125,7 @@ def _reconcile_orphans(silent: bool = False, chat_id: int | None = None,
         try:
             r = subprocess.run(
                 ["docker", "exec", "beets", "beet", "import", "-q",
-                 "--noautotag", container_dir],
+                 "--noautotag", "--noincremental", container_dir],
                 capture_output=True, text=True, timeout=1800)
             if r.returncode != 0:
                 failed_dirs.append(host_dir)
