@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NAS Controller — cron jobs, file watcher, Spotify import, Telegram bot."""
 
-import csv, hashlib, hmac, io, json, logging, os, re, shutil, sqlite3, subprocess, threading, time, urllib.parse, urllib.request, uuid, urllib.error
+import csv, hashlib, hmac, io, json, logging, os, re, shutil, sqlite3, subprocess, threading, time, unicodedata, urllib.parse, urllib.request, uuid, urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, Response, request, redirect
@@ -4273,45 +4273,75 @@ def _container_to_host_path(p: str) -> str:
     return p
 
 
-def _split_artist_title(query: str) -> tuple[str, str]:
-    parts = re.split(r"\s*[—–\-]\s*", query.strip(), maxsplit=1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-    return query.strip(), query.strip()
+def _normalize_text(s) -> str:
+    """Lowercase + strip diacritics + collapse whitespace. Returns '' on None."""
+    if s is None:
+        return ""
+    if isinstance(s, bytes):
+        try: s = s.decode("utf-8", errors="replace")
+        except Exception: s = ""
+    s = unicodedata.normalize("NFD", str(s).lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _beets_open_ro():
+    """Open beets DB read-only and register the norm() UDF for diacritic-insensitive search."""
+    con = sqlite3.connect(f"file:{BEETS_DB}?mode=ro", uri=True)
+    con.create_function("norm", 1, _normalize_text, deterministic=True)
+    return con
 
 
 def _beets_search(query: str, page: int = 0) -> tuple[list, int]:
+    """Token-AND search across artist+title+album+year, diacritic-insensitive.
+
+    "kaaris or noir" → matches `Kaaris — Or noir (intro)` (3 tokens, 2 fields).
+    "fusee" → matches `Dans la fusée` (accent stripped).
+    Ranks by field weight: artist (3) > title (2) > album (1).
+    """
     if not BEETS_DB.exists():
         log.warning("[del] beets DB not mounted at %s", BEETS_DB)
         return [], 0
-    artist_q, title_q = _split_artist_title(query)
-    a_like = f"%{artist_q.lower()}%"
-    t_like = f"%{title_q.lower()}%"
+    tokens = [_normalize_text(t) for t in query.split() if t.strip()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return [], 0
     try:
-        con = sqlite3.connect(f"file:{BEETS_DB}?mode=ro", uri=True)
-        total = con.execute(
-            "SELECT COUNT(*) FROM items "
-            "WHERE LOWER(artist) LIKE ? OR LOWER(title) LIKE ? OR LOWER(album) LIKE ?",
-            (a_like, t_like, t_like)).fetchone()[0]
+        con = _beets_open_ro()
+        haystack = ("norm(IFNULL(artist,'') || ' ' || IFNULL(title,'') || ' ' || "
+                    "IFNULL(album,'') || ' ' || COALESCE(CAST(year AS TEXT),''))")
+        where = " AND ".join([f"{haystack} LIKE ?" for _ in tokens])
+        like_params = [f"%{t}%" for t in tokens]
+        # Rank by which fields the FIRST token hits — cheap proxy that surfaces
+        # artist-hits above album-hits without needing per-token scoring per row.
+        first_like = like_params[0]
+        score_expr = (
+            "(CASE WHEN norm(IFNULL(artist,'')) LIKE ? THEN 3 ELSE 0 END) + "
+            "(CASE WHEN norm(IFNULL(title,''))  LIKE ? THEN 2 ELSE 0 END) + "
+            "(CASE WHEN norm(IFNULL(album,''))  LIKE ? THEN 1 ELSE 0 END)"
+        )
+        total = con.execute(f"SELECT COUNT(*) FROM items WHERE {where}", like_params).fetchone()[0]
         rows = con.execute(
-            "SELECT id, album_id, artist, title, album, year, path "
-            "FROM items "
-            "WHERE LOWER(artist) LIKE ? OR LOWER(title) LIKE ? OR LOWER(album) LIKE ? "
-            "ORDER BY artist, album, track "
-            "LIMIT ? OFFSET ?",
-            (a_like, t_like, t_like, DEL_PAGE_SIZE, page * DEL_PAGE_SIZE)).fetchall()
+            f"SELECT id, album_id, artist, title, album, year, path, "
+            f"       {score_expr} AS score "
+            f"FROM items WHERE {where} "
+            f"ORDER BY score DESC, artist, album, track "
+            f"LIMIT ? OFFSET ?",
+            [first_like, first_like, first_like, *like_params,
+             DEL_PAGE_SIZE, page * DEL_PAGE_SIZE]).fetchall()
         con.close()
     except Exception as e:
         log.warning("[del] beets query failed: %s", e)
         return [], 0
-    return [_row_to_track(r) for r in rows], total
+    # Drop the trailing score column before returning
+    return [_row_to_track(r[:7]) for r in rows], total
 
 
 def _beets_album_tracks(album_id: int) -> list:
     if not BEETS_DB.exists():
         return []
     try:
-        con = sqlite3.connect(f"file:{BEETS_DB}?mode=ro", uri=True)
+        con = _beets_open_ro()
         rows = con.execute(
             "SELECT id, album_id, artist, title, album, year, path "
             "FROM items WHERE album_id = ? ORDER BY track",
