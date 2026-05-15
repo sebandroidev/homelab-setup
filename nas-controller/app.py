@@ -5592,6 +5592,11 @@ def _load_and_resume_downloads():
 GEMINI_API_KEY            = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL              = "gemini-2.5-flash"
 GEMINI_BASE               = "https://generativelanguage.googleapis.com/v1beta"
+GROQ_API_KEY              = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE                 = "https://api.groq.com/openai/v1"
+GROQ_TEXT_MODEL           = "llama-3.3-70b-versatile"
+GROQ_AUDIO_MODEL          = "whisper-large-v3"
+WHISPER_MAX_DURATION      = 90    # seconds — keep transcription under 30s
 TMDB_API_KEY              = os.getenv("TMDB_API_KEY", "")
 TMDB_BASE                 = "https://api.themoviedb.org/3"
 TMDB_IMG_W500             = "https://image.tmdb.org/t/p/w500"
@@ -5935,6 +5940,145 @@ def _gemini_video_pass(file_uri: str, mime: str = "video/mp4") -> dict | None:
         return parsed
     except Exception as e:
         log.warning("[find] Gemini video parse failed: %s", e); return None
+
+
+# ── Groq fallback (free Llama 3.3 70B + Whisper) ─────────────────────────────
+_GROQ_RECOVERABLE = {"rate_limited", "overloaded", "timeout"}
+
+
+def _groq_text_pass(meta: dict, extra_context: str = "") -> dict | None:
+    """Mirror of _gemini_text_pass using Groq Llama 3.3 70B.
+    extra_context is appended to the metadata block — used to inject a
+    Whisper transcript when called from the video fallback."""
+    if not GROQ_API_KEY:
+        return None
+    prompt = (
+        "Given this video's metadata from a clip-sharing site, identify the "
+        "movie or TV show featured in the video. The video is likely a fan edit, "
+        "trailer, scene compilation, or reaction.\n\n"
+        f"METADATA:\n```json\n{json.dumps(meta, ensure_ascii=False)[:3000]}\n```\n"
+        f"{extra_context}\n"
+        "IMPORTANT title rules:\n"
+        "- Preserve the *complete* canonical title verbatim — including unusual "
+        "punctuation. Don't drop interjections or prefixes like 'Yoh!'.\n"
+        "- For anime, prefer the international English title (Attack on Titan, "
+        "not Shingeki no Kyojin). Set is_anime=true ONLY for Japanese animation.\n"
+        "- Strip caption noise (emoji, hashtags, 'now playing on Netflix').\n"
+        "- If the metadata is GENERIC (e.g. 'amazing anime scene', empty desc) "
+        "you MUST return kind='unknown', title=null, confidence ≤ 0.3. Do NOT "
+        "guess a title that merely matches the genre.\n\n"
+        "Respond with ONLY a JSON object, no prose, in this schema:\n"
+        '{"kind":"movie"|"tv"|"unknown","title":"string or null",'
+        '"year":integer or null,"is_anime":boolean,'
+        '"confidence":number 0.0-1.0,"reasoning":"one short sentence"}'
+    )
+    body = {
+        "model": GROQ_TEXT_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }
+    try:
+        req = urllib.request.Request(
+            f"{GROQ_BASE}/chat/completions",
+            data=json.dumps(body).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        log.warning("[find] Groq HTTP %d: %s", e.code, e.read()[:200])
+        return None
+    except Exception as e:
+        log.warning("[find] Groq exception: %s", e)
+        return None
+    try:
+        txt = res["choices"][0]["message"]["content"]
+        parsed = json.loads(txt)
+        log.info("[find] Groq: kind=%s title=%r year=%s conf=%.2f",
+                 parsed.get("kind"), parsed.get("title"),
+                 parsed.get("year"), parsed.get("confidence", 0))
+        return parsed
+    except Exception as e:
+        log.warning("[find] Groq parse failed: %s", e); return None
+
+
+def _extract_audio(video_path: Path) -> Path | None:
+    """ffmpeg: pull the first WHISPER_MAX_DURATION seconds as mono 16 kHz WAV."""
+    if not video_path.exists():
+        return None
+    audio_path = video_path.with_suffix(".wav")
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(video_path),
+             "-vn", "-ac", "1", "-ar", "16000",
+             "-t", str(WHISPER_MAX_DURATION),
+             "-loglevel", "error",
+             str(audio_path)],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or not audio_path.exists():
+            log.warning("[find] ffmpeg audio extract failed (%d): %s",
+                        r.returncode, r.stderr[:200])
+            return None
+    except Exception as e:
+        log.warning("[find] ffmpeg exception: %s", e); return None
+    return audio_path
+
+
+def _groq_whisper(audio_path: Path) -> str | None:
+    """Groq audio/transcriptions — whisper-large-v3 free tier."""
+    if not GROQ_API_KEY or not audio_path.exists():
+        return None
+    # Build multipart/form-data manually to avoid pulling in requests.
+    boundary = "----nasctrl" + uuid.uuid4().hex
+    fields = {"model": GROQ_AUDIO_MODEL, "response_format": "text"}
+    body = io.BytesIO()
+    for k, v in fields.items():
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode())
+        body.write(f"{v}\r\n".encode())
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode())
+    body.write(b"Content-Type: audio/wav\r\n\r\n")
+    body.write(audio_path.read_bytes())
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+    data = body.getvalue()
+    try:
+        req = urllib.request.Request(
+            f"{GROQ_BASE}/audio/transcriptions",
+            data=data, method="POST",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": f"multipart/form-data; boundary={boundary}",
+                     "Content-Length": str(len(data))})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            text = r.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as e:
+        log.warning("[find] Whisper HTTP %d: %s", e.code, e.read()[:200])
+        return None
+    except Exception as e:
+        log.warning("[find] Whisper exception: %s", e)
+        return None
+    log.info("[find] Whisper transcript (%d chars): %r…",
+             len(text), text[:100])
+    return text
+
+
+def _groq_video_pass(meta: dict, video_path: Path) -> dict | None:
+    """Audio-only video fallback: ffmpeg → Whisper transcript → Groq Llama."""
+    audio = _extract_audio(video_path)
+    if not audio:
+        return None
+    try:
+        transcript = _groq_whisper(audio)
+    finally:
+        try: audio.unlink()
+        except Exception: pass
+    if not transcript:
+        return None
+    extra = (f"\nWHISPER TRANSCRIPT (first {WHISPER_MAX_DURATION}s of audio):\n"
+             f"```\n{transcript[:2000]}\n```\n")
+    return _groq_text_pass(meta, extra_context=extra)
 
 
 # ── AniList (anime DB, GraphQL) ──────────────────────────────────────────────
@@ -6378,6 +6522,9 @@ def _render_find_info(candidate: dict, source_url: str = "",
     if source_url:
         host = urllib.parse.urlparse(source_url).netloc
         lines.append(f"\n_Source: {host}_")
+    identified_by = candidate.get("_identified_by")
+    if identified_by and identified_by != "Gemini 2.5 Flash":
+        lines.append(f"_Identified by: {identified_by}_")
 
     rows = [[{"text": "➕ Add to watchlist", "callback_data": "find:add"}]]
     if show_pick_again:
@@ -6537,15 +6684,28 @@ def _handle_find_url(chat_id: int, url: str):
                 f"({err or 'unknown error'})")
         return
 
-    # Stage 2: Gemini text pass
+    # Stage 2: Gemini text pass with Groq fallback on recoverable errors
     tg_edit(chat_id, msg_id, "🤖 Asking Gemini to identify the media…")
     gemini = _gemini_text_pass(meta)
+    identified_by = "Gemini 2.5 Flash"
     if not gemini:
         tg_edit(chat_id, msg_id, "❌ Gemini parse failed (unexpected response). Check logs.")
         return
     if gemini.get("_error"):
-        tg_edit(chat_id, msg_id, _gemini_error_msg(gemini["_error"]))
-        return
+        err = gemini["_error"]
+        if err in _GROQ_RECOVERABLE and GROQ_API_KEY:
+            tg_edit(chat_id, msg_id,
+                    f"🤖 Gemini {err} — switching to Groq Llama 3.3 70B…")
+            gemini = _groq_text_pass(meta)
+            identified_by = "Llama 3.3 70B via Groq"
+            if not gemini or gemini.get("_error"):
+                tg_edit(chat_id, msg_id,
+                        f"❌ Both Gemini ({err}) and Groq are unavailable. "
+                        f"Try again later or tap 🔁 to refine manually.")
+                return
+        else:
+            tg_edit(chat_id, msg_id, _gemini_error_msg(err))
+            return
 
     kind, title = gemini.get("kind"), gemini.get("title")
     conf = float(gemini.get("confidence") or 0)
@@ -6565,44 +6725,84 @@ def _handle_find_url(chat_id: int, url: str):
         kind, title, conf = "unknown", None, 0.0   # force the escalation branch below
 
     if kind == "unknown" or not title or conf < FIND_CONFIDENCE_ESCALATE:
-        # Stage 2: video escalation — feed the actual frames+audio to Gemini.
-        if _is_youtube_url(url):
+        # Stage 2: video escalation — Gemini multimodal primary, Groq audio fallback.
+        # For non-YouTube URLs we always need the local download (also used for
+        # the Groq Whisper fallback). For YouTube, Gemini ingests natively but
+        # we ALSO download if Gemini errors so Groq has bytes to work with.
+        local_path: Path | None = None
+        video: dict | None = None
+
+        def _gemini_video_attempt() -> dict | None:
+            nonlocal local_path
+            if _is_youtube_url(url):
+                tg_edit(chat_id, msg_id,
+                        "🎞 Asking Gemini to watch the YouTube video…")
+                return _gemini_video_pass(url, mime="video/*")
             tg_edit(chat_id, msg_id,
-                    "🎞 Low confidence from metadata — asking Gemini to watch the YouTube video…")
-            video = _gemini_video_pass(url, mime="video/*")
-        else:
-            tg_edit(chat_id, msg_id,
-                    f"🎞 Low confidence from metadata — downloading the clip "
-                    f"(≤{GEMINI_VIDEO_MAX_MB} MB)…")
-            tmpdir = Path("/tmp/find_dl")
-            tmpdir.mkdir(parents=True, exist_ok=True)
+                    f"🎞 Downloading the clip (≤{GEMINI_VIDEO_MAX_MB} MB)…")
+            tmpdir = Path("/tmp/find_dl"); tmpdir.mkdir(parents=True, exist_ok=True)
             dst = tmpdir / f"{uuid.uuid4().hex[:10]}.mp4"
             path, dl_err = _ytdlp_download(url, dst)
             if dl_err == "rate_limited":
                 tg_edit(chat_id, msg_id,
-                        f"🚦 `{_esc(host)}` is rate-limiting downloads right now "
-                        "(HTTP 429). Try again in ~10–15 minutes.")
-                return
+                        f"🚦 `{_esc(host)}` is rate-limiting downloads (HTTP 429). "
+                        "Try again in ~10–15 minutes.")
+                return {"_error": "rate_limited"}
             if not path or not path.exists():
                 tg_edit(chat_id, msg_id,
-                        f"❌ Couldn't download the clip ({dl_err or 'too large / geo-blocked / unsupported'}).")
-                return
-            try:
-                tg_edit(chat_id, msg_id, "📤 Uploading to Gemini Files API…")
-                file_uri = _gemini_upload_file(path)
-                if not file_uri:
-                    tg_edit(chat_id, msg_id, "❌ Gemini Files API upload failed.")
-                    return
-                tg_edit(chat_id, msg_id, "🤖 Asking Gemini to watch the clip…")
-                video = _gemini_video_pass(file_uri)
-            finally:
-                try: path.unlink()
-                except Exception: pass
+                        f"❌ Couldn't download the clip ({dl_err or 'too large / unsupported'}).")
+                return {"_error": "download_failed"}
+            local_path = path
+            tg_edit(chat_id, msg_id, "📤 Uploading to Gemini Files API…")
+            file_uri = _gemini_upload_file(path)
+            if not file_uri:
+                tg_edit(chat_id, msg_id, "❌ Gemini Files API upload failed.")
+                return {"_error": "upload_failed"}
+            tg_edit(chat_id, msg_id, "🤖 Asking Gemini to watch the clip…")
+            return _gemini_video_pass(file_uri)
+
+        video = _gemini_video_attempt()
+        if video and video.get("_error") in _GROQ_RECOVERABLE and GROQ_API_KEY:
+            # Gemini hit a recoverable error — fall through to Groq audio path.
+            # For YouTube we still need to download the bytes locally.
+            err = video["_error"]
+            if _is_youtube_url(url) and not local_path:
+                tg_edit(chat_id, msg_id,
+                        f"🤖 Gemini {err} — downloading the YouTube clip locally for "
+                        "Groq Whisper fallback…")
+                tmpdir = Path("/tmp/find_dl"); tmpdir.mkdir(parents=True, exist_ok=True)
+                dst = tmpdir / f"{uuid.uuid4().hex[:10]}.mp4"
+                path, _ = _ytdlp_download(url, dst)
+                if path and path.exists():
+                    local_path = path
+            if local_path:
+                tg_edit(chat_id, msg_id,
+                        f"🎙 Transcribing audio with Groq Whisper, then identifying…")
+                groq_result = _groq_video_pass(meta, local_path)
+                if groq_result:
+                    video = groq_result
+                    identified_by = "Llama 3.3 70B via Groq (Whisper audio)"
+
+        # Cleanup downloaded video regardless of path taken
+        if local_path:
+            try: local_path.unlink()
+            except Exception: pass
+
         if not video:
-            tg_edit(chat_id, msg_id, "❌ Gemini video parse failed. Check logs.")
+            tg_edit(chat_id, msg_id, "❌ Video pass parse failed. Check logs.")
             return
         if video.get("_error"):
-            tg_edit(chat_id, msg_id, _gemini_error_msg(video["_error"]))
+            err = video["_error"]
+            if err in _GROQ_RECOVERABLE and not GROQ_API_KEY:
+                tg_edit(chat_id, msg_id,
+                        f"❌ Gemini video pass {err}, and no Groq fallback configured "
+                        f"(`GROQ_API_KEY` empty).")
+            elif err == "rate_limited":
+                pass  # message already edited above
+            elif err in ("download_failed", "upload_failed"):
+                pass
+            else:
+                tg_edit(chat_id, msg_id, _gemini_error_msg(err))
             return
         gemini = video  # override the weak text-pass result
         kind, title, conf, year = (video.get("kind"), video.get("title"),
@@ -6610,7 +6810,7 @@ def _handle_find_url(chat_id: int, url: str):
                                     video.get("year"))
         if kind == "unknown" or not title:
             tg_edit(chat_id, msg_id,
-                    f"🤷 Gemini still couldn't identify the media after watching "
+                    f"🤷 Still couldn't identify the media after watching "
                     f"the clip.\n\nReasoning: _{_esc(video.get('reasoning',''))[:200]}_")
             return
 
@@ -6639,14 +6839,19 @@ def _handle_find_url(chat_id: int, url: str):
                 f"🤷 Gemini found `{_esc(title)}` but no match on {sources}.")
         return
 
+    # Tag each candidate with the identifier model for the info-card footer
+    for c in candidates:
+        c["_identified_by"] = identified_by
+
     # Build session
     session = {
-        "chat_id":    chat_id,
-        "url":        url,
-        "gemini":     gemini,
-        "candidates": candidates,
-        "picked":     0,
-        "msg_id":     msg_id,
+        "chat_id":       chat_id,
+        "url":           url,
+        "gemini":        gemini,
+        "identified_by": identified_by,
+        "candidates":    candidates,
+        "picked":        0,
+        "msg_id":        msg_id,
     }
     _find_session_set(chat_id, session)
 
