@@ -579,9 +579,16 @@ def _run_manual_maintenance(chat_id: int, msg_id: int):
         return
 
     art_ok = org_ok = False
+    rec_imported = 0
     art_org_error = None
     try:
-        _edit("🗂 *Library Sync*\n🎨 Fetching art & covers…")
+        # Stage 0: reconcile orphans — import any files on disk that beets doesn't know about
+        _edit(f"🗂 *Library Sync*\n📥 Reconciling new files…\n⏱ {_elapsed()}")
+        rec_imported = _reconcile_orphans(silent=True)
+        _refresh_all_watch_dirs()
+
+        rec_line = f"📥 Imported *{rec_imported}* new" if rec_imported else "📥 Nothing to import"
+        _edit(f"🗂 *Library Sync*\n{rec_line}\n🎨 Fetching art & covers…\n⏱ {_elapsed()}")
         r_art = subprocess.run(
             'docker exec beets beet fetchart ; docker exec beets beet embedart -y',
             shell=True, capture_output=True, text=True, timeout=1800)
@@ -674,8 +681,9 @@ def _run_manual_maintenance(chat_id: int, msg_id: int):
         except Exception as _e:
             log.warning("[maint] Navidrome rescan failed: %s", _e)
 
+        rec_line = f"📥 Imported {rec_imported} new\n" if rec_imported else ""
         _edit(
-            f"🗂 *Library Sync* ✅\n{art_line}\n"
+            f"🗂 *Library Sync* ✅\n{rec_line}{art_line}\n"
             f"🎵 {summary_line}\n"
             f"⏱ Total: {_elapsed()}"
         )
@@ -726,6 +734,7 @@ _NAS_ACTIONS = {
 def _nas_control_menu_kb():
     rows = [[{"text": a["label"], "callback_data": f"nas:{key}"}]
             for key, a in _NAS_ACTIONS.items()]
+    rows.append([{"text": "📥 Reconcile orphans", "callback_data": "nas:reconcile"}])
     rows.append([{"text": "🧹 Empty trash", "callback_data": "nas:trash:empty"}])
     rows.append([{"text": "❌ Close", "callback_data": "nas:cancel"}])
     return _inline(rows)
@@ -3604,6 +3613,12 @@ def handle_callback(cq: dict):
         threading.Thread(target=_run_undo, args=(chat_id, msg_id, trash_id), daemon=True).start()
         return
 
+    if data == "nas:reconcile":
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_reconcile_orphans_with_lock,
+                         args=(chat_id, msg_id), daemon=True).start()
+        return
+
     if data == "nas:trash:empty":
         msg_id = cq.get("message", {}).get("message_id")
         threading.Thread(target=_empty_trash_preview, args=(chat_id, msg_id), daemon=True).start()
@@ -4750,6 +4765,126 @@ def _run_undo(chat_id, msg_id, trash_id):
         _pipeline_lock.release()
 
 
+ORPHAN_RECONCILE_INTERVAL = 6 * 3600  # 6h
+
+
+def _list_orphans() -> dict[str, list[str]]:
+    """Compare /media/nas-hdd/Musics + Evyy Musics against beets DB.
+    Returns {host_dir: [host_file, ...]} of audio files unknown to beets."""
+    if not BEETS_DB.exists():
+        return {}
+    try:
+        con = _beets_open_ro()
+        known_paths = set()
+        for (p,) in con.execute("SELECT path FROM items"):
+            if isinstance(p, bytes):
+                p = p.decode("utf-8", errors="replace")
+            known_paths.add(_container_to_host_path(p))
+        con.close()
+    except Exception as e:
+        log.warning("[reconcile] beets DB read failed: %s", e)
+        return {}
+    orphans: dict[str, list[str]] = {}
+    for d in WATCH_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if not x.startswith(".")]
+            for fname in files:
+                if os.path.splitext(fname)[1].lower() not in AUDIO_EXTS:
+                    continue
+                fp = os.path.join(root, fname)
+                if fp not in known_paths:
+                    orphans.setdefault(root, []).append(fp)
+    return orphans
+
+
+def _reconcile_orphans(silent: bool = False, chat_id: int | None = None) -> int:
+    """Import every disk file not in beets, one directory at a time, with --noautotag.
+    Returns the count of newly-imported files. Hold _pipeline_lock externally
+    when calling from a flow that already owns it (e.g. Library Sync); the
+    background daemon and manual NAS Control invocation acquire it themselves."""
+    orphans = _list_orphans()
+    if not orphans:
+        log.info("[reconcile] no orphans")
+        if not silent and chat_id:
+            try: tg_send(chat_id, "📥 No orphans — library matches disk.")
+            except Exception: pass
+        return 0
+    total_files = sum(len(v) for v in orphans.values())
+    log.info("[reconcile] %d orphan files across %d dirs", total_files, len(orphans))
+    imported = 0
+    failed_dirs: list[str] = []
+    for host_dir in orphans:
+        # Translate host dir to container view for beets
+        container_dir = host_dir
+        for host, container in BEETS_DIR_MAP.items():
+            if host_dir == host or host_dir.startswith(host + "/"):
+                container_dir = container + host_dir[len(host):]
+                break
+        try:
+            r = subprocess.run(
+                ["docker", "exec", "beets", "beet", "import", "-q",
+                 "--noautotag", container_dir],
+                capture_output=True, text=True, timeout=1800)
+            if r.returncode == 0:
+                imported += len(orphans[host_dir])
+            else:
+                failed_dirs.append(host_dir)
+                log.warning("[reconcile] import failed for %s: %s",
+                            host_dir, (r.stderr or r.stdout)[:200])
+        except Exception as e:
+            failed_dirs.append(host_dir)
+            log.warning("[reconcile] import exec failed for %s: %s", host_dir, e)
+    log.info("[reconcile] imported=%d failed_dirs=%d", imported, len(failed_dirs))
+    if not silent:
+        head = "\n".join(f"  • {Path(d).name}: {len(orphans[d])} track(s)"
+                         for d in list(orphans)[:8])
+        more = f"\n…and {len(orphans)-8} more dir(s)" if len(orphans) > 8 else ""
+        tail = f"\n⚠️ {len(failed_dirs)} dir(s) failed" if failed_dirs else ""
+        msg = (f"📥 *Reconciled {imported}* new track(s) from {len(orphans)} dir(s):\n"
+               f"{head}{more}{tail}")
+        if chat_id:
+            try: tg_send(chat_id, msg)
+            except Exception: pass
+        else:
+            for cid in ALLOWED_IDS:
+                try: tg_send(cid, msg)
+                except Exception: pass
+    return imported
+
+
+def _reconcile_orphans_with_lock(chat_id: int | None = None, msg_id: int | None = None):
+    """Wrapper that takes _pipeline_lock; for background daemon + manual button."""
+    if not _pipeline_lock.acquire(blocking=False):
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, "⚠️ A pipeline is currently running — try again later.")
+        elif chat_id:
+            tg_send(chat_id, "⚠️ A pipeline is currently running — try again later.")
+        return
+    try:
+        if chat_id and msg_id:
+            tg_edit(chat_id, msg_id, "📥 Scanning for orphan files…")
+        imported = _reconcile_orphans(silent=False, chat_id=chat_id)
+        if imported:
+            try: _nav_request("startScan")
+            except Exception: pass
+    finally:
+        _pipeline_lock.release()
+
+
+def _orphan_reconcile_loop():
+    """Background daemon: every 6h scan disk vs beets, auto-import any new files."""
+    # Initial delay so we don't race with startup
+    time.sleep(300)
+    while True:
+        try:
+            _reconcile_orphans_with_lock(chat_id=None)
+        except Exception as e:
+            log.warning("[reconcile] loop error: %s", e)
+        time.sleep(ORPHAN_RECONCILE_INTERVAL)
+
+
 def _trash_purge_loop():
     while True:
         time.sleep(TRASH_PURGE_INTERVAL)
@@ -5006,5 +5141,6 @@ if __name__ == "__main__":
     threading.Thread(target=_downloads_flush_loop,   daemon=True).start()
     _load_and_resume_downloads()
     _load_trash()
-    threading.Thread(target=_trash_purge_loop,       daemon=True).start()
+    threading.Thread(target=_trash_purge_loop,        daemon=True).start()
+    threading.Thread(target=_orphan_reconcile_loop,   daemon=True).start()
     app.run(host="0.0.0.0", port=8888, debug=False)
