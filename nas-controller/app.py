@@ -106,7 +106,7 @@ TG_KEYBOARD = json.dumps({
     "keyboard": [
         [{"text": "⬇️ Download Tracks"}, {"text": "📊 NAS Stats"}],
         [{"text": "🗂 Library"}, {"text": "🔌 NAS Control"}],
-        [{"text": "🌐 Services"}],
+        [{"text": "🌐 Services"}, {"text": "🎦 Media"}],
     ],
     "resize_keyboard": True,
     "persistent": True,
@@ -115,6 +115,15 @@ TG_KEYBOARD = json.dumps({
 TG_LIBRARY_KB = json.dumps({
     "keyboard": [
         [{"text": "▶️ Run Sync"}, {"text": "🗑 Delete Tracks"}],
+        [{"text": "↩️ Back"}],
+    ],
+    "resize_keyboard": True,
+    "persistent": True,
+})
+
+TG_MEDIA_KB = json.dumps({
+    "keyboard": [
+        [{"text": "🔍 Find Infos"}, {"text": "📺 Watchlist"}],
         [{"text": "↩️ Back"}],
     ],
     "resize_keyboard": True,
@@ -170,6 +179,13 @@ _dl_meta:   dict = {}   # dl_id -> {chat_id, msg_id, username, filenames, kind, 
 _del_pending: set = set()       # chat_ids awaiting search query
 _del_session: dict = {}         # chat_id -> session dict
 _del_lock     = threading.Lock()
+
+# Find Infos + Watchlist state
+_find_pending: set = set()      # chat_ids awaiting video URL
+_find_session: dict = {}        # chat_id -> {url, candidates, picked, gemini, expires_at, msg_id}
+_wl_session:   dict = {}        # chat_id -> {status, sort, page, items, total, expires_at, msg_id}
+_find_lock     = threading.Lock()
+_wl_lock       = threading.Lock()
 _trash:       dict = {"version": 1, "entries": {}}
 _trash_lock   = threading.Lock()
 _sp_lock = threading.Lock()
@@ -4029,6 +4045,25 @@ def handle_tg(chat_id, text):
         threading.Thread(target=_send_services_status, args=(chat_id,), daemon=True).start()
         return
 
+    # ── Media submenu (🎦) ────────────────────────────────────────────────────
+    if text in ("🎦 Media",) or t == "media":
+        tg_send(chat_id, "🎦 *Media*\nChoose an action:", reply_markup=TG_MEDIA_KB)
+        return
+
+    if text in ("🔍 Find Infos",) or ("find" in t and "info" in t):
+        _handle_find_start(chat_id)
+        return
+
+    if text in ("📺 Watchlist",) or t == "watchlist":
+        threading.Thread(target=_handle_watchlist_open, args=(chat_id,), daemon=True).start()
+        return
+
+    # If chat is awaiting a video URL for Find Infos
+    if chat_id in _find_pending:
+        _find_pending.discard(chat_id)
+        threading.Thread(target=_handle_find_url, args=(chat_id, text), daemon=True).start()
+        return
+
     tg_send(chat_id, "Tap a button below.", reply_markup=TG_KEYBOARD)
 
 def _check_service(svc: dict) -> bool:
@@ -5299,6 +5334,64 @@ def _load_and_resume_downloads():
         if chat_id and msg_id:
             threading.Thread(target=_monitor_download,
                              args=(chat_id, dl_id, msg_id), daemon=True).start()
+
+
+# ── Find Infos + Watchlist ────────────────────────────────────────────────────
+GEMINI_API_KEY            = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL              = "gemini-2.5-flash"
+GEMINI_BASE               = "https://generativelanguage.googleapis.com/v1beta"
+TMDB_API_KEY              = os.getenv("TMDB_API_KEY", "")
+TMDB_BASE                 = "https://api.themoviedb.org/3"
+TMDB_IMG_W500             = "https://image.tmdb.org/t/p/w500"
+WATCHARR_URL              = os.getenv("WATCHARR_URL", "http://host.docker.internal:3201")
+WATCHARR_TOKEN            = os.getenv("WATCHARR_TOKEN", "")
+FIND_CONFIDENCE_AUTO_PICK = 0.85
+FIND_CONFIDENCE_ESCALATE  = 0.60
+GEMINI_VIDEO_MAX_MB       = 50
+GEMINI_VIDEO_MAX_DURATION = 90
+FIND_SESSION_TTL          = 600
+WL_PAGE_SIZE              = 10
+
+
+def _handle_find_start(chat_id: int):
+    """Prompt the user for a video URL to identify."""
+    if not GEMINI_API_KEY:
+        tg_send(chat_id, "❌ `GEMINI_API_KEY` not configured. Set it in .env and restart.")
+        return
+    _find_pending.add(chat_id)
+    tg_send(chat_id,
+            "🔍 *Find Infos*\n\n"
+            "Send a video URL (YouTube, TikTok, IG Reels, X, Reddit, etc.).\n"
+            "I'll identify the movie or TV show and look up its details.")
+
+
+def _handle_find_url(chat_id: int, url: str):
+    """Pipeline stub — full implementation lands in commit 3."""
+    if not url.strip().startswith(("http://", "https://")):
+        tg_send(chat_id, "❌ Not a valid URL. Tap 🔍 Find Infos to retry.",
+                reply_markup=TG_MEDIA_KB)
+        return
+    tg_send(chat_id, "🚧 *Find Infos* pipeline lands in the next commit — your URL is `" +
+            _esc(url[:200]) + "`.", reply_markup=TG_MEDIA_KB)
+
+
+def _handle_watchlist_open(chat_id: int, msg_id: int | None = None,
+                            status: str = "all", sort: str = "recent", page: int = 0):
+    """Watchlist browser stub — full implementation lands in commit 5."""
+    if not WATCHARR_TOKEN:
+        text = ("⚠️ `WATCHARR_TOKEN` not configured.\n\n"
+                "1. Open https://watchlist.bastienlab.com\n"
+                "2. Sign up the admin account\n"
+                "3. Settings → Tokens → Create read+write token\n"
+                "4. Add to /opt/apps/nas-controller/.env as `WATCHARR_TOKEN=...`\n"
+                "5. Restart the container")
+        if msg_id:
+            tg_edit(chat_id, msg_id, text)
+        else:
+            tg_send(chat_id, text)
+        return
+    tg_send(chat_id, "🚧 Watchlist browser lands in commit 5.",
+            reply_markup=TG_MEDIA_KB)
 
 
 if __name__ == "__main__":
