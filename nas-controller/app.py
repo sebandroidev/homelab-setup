@@ -3543,10 +3543,11 @@ def handle_callback(cq: dict):
         new_page = max(0, min(s["pages"] - 1, s["page"] + delta))
         if new_page == s["page"]: return
         # Re-query for new page
-        results, total = _beets_search(s["query"], page=new_page)
+        results, total, fuzzy = _beets_search(s["query"], page=new_page)
         s["results"] = results
         s["page"]    = new_page
         s["total"]   = total
+        s["fuzzy"]   = fuzzy
         # Refresh albums map from new page
         for r in results:
             aid = r["album_id"]
@@ -4273,8 +4274,13 @@ def _container_to_host_path(p: str) -> str:
     return p
 
 
+_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+
+
 def _normalize_text(s) -> str:
-    """Lowercase + strip diacritics + collapse whitespace. Returns '' on None."""
+    """Lowercase + strip diacritics + strip punctuation + collapse whitespace.
+    Returns '' on None. Used both on stored fields (via sqlite UDF) and on
+    query tokens, so `(unc` -> `unc`, `phew)` -> `phew`, `naïve` -> `naive`."""
     if s is None:
         return ""
     if isinstance(s, bytes):
@@ -4282,6 +4288,7 @@ def _normalize_text(s) -> str:
         except Exception: s = ""
     s = unicodedata.normalize("NFD", str(s).lower())
     s = "".join(c for c in s if not unicodedata.combining(c))
+    s = _PUNCT_RE.sub(" ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -4292,49 +4299,79 @@ def _beets_open_ro():
     return con
 
 
-def _beets_search(query: str, page: int = 0) -> tuple[list, int]:
-    """Token-AND search across artist+title+album+year, diacritic-insensitive.
+def _beets_search(query: str, page: int = 0) -> tuple[list, int, bool]:
+    """Token search across artist+title+album+year, diacritic+punct-insensitive.
 
-    "kaaris or noir" → matches `Kaaris — Or noir (intro)` (3 tokens, 2 fields).
-    "fusee" → matches `Dans la fusée` (accent stripped).
-    Ranks by field weight: artist (3) > title (2) > album (1).
+    Strict pass: every token must appear (AND) anywhere in the concatenated
+    haystack. If strict yields 0 rows, falls back to a fuzzy OR pass where at
+    least one token is enough — useful for typos or tracks the user thinks
+    they have but don't.
+
+    Returns (rows, total, fuzzy_fallback_used).
     """
     if not BEETS_DB.exists():
         log.warning("[del] beets DB not mounted at %s", BEETS_DB)
-        return [], 0
+        return [], 0, False
     tokens = [_normalize_text(t) for t in query.split() if t.strip()]
     tokens = [t for t in tokens if t]
     if not tokens:
-        return [], 0
+        return [], 0, False
     try:
         con = _beets_open_ro()
         haystack = ("norm(IFNULL(artist,'') || ' ' || IFNULL(title,'') || ' ' || "
                     "IFNULL(album,'') || ' ' || COALESCE(CAST(year AS TEXT),''))")
-        where = " AND ".join([f"{haystack} LIKE ?" for _ in tokens])
         like_params = [f"%{t}%" for t in tokens]
-        # Rank by which fields the FIRST token hits — cheap proxy that surfaces
-        # artist-hits above album-hits without needing per-token scoring per row.
-        first_like = like_params[0]
-        score_expr = (
+        first_like  = like_params[0]
+        score_expr  = (
             "(CASE WHEN norm(IFNULL(artist,'')) LIKE ? THEN 3 ELSE 0 END) + "
             "(CASE WHEN norm(IFNULL(title,''))  LIKE ? THEN 2 ELSE 0 END) + "
             "(CASE WHEN norm(IFNULL(album,''))  LIKE ? THEN 1 ELSE 0 END)"
         )
-        total = con.execute(f"SELECT COUNT(*) FROM items WHERE {where}", like_params).fetchone()[0]
-        rows = con.execute(
-            f"SELECT id, album_id, artist, title, album, year, path, "
-            f"       {score_expr} AS score "
-            f"FROM items WHERE {where} "
-            f"ORDER BY score DESC, artist, album, track "
-            f"LIMIT ? OFFSET ?",
-            [first_like, first_like, first_like, *like_params,
-             DEL_PAGE_SIZE, page * DEL_PAGE_SIZE]).fetchall()
+
+        # Strict pass: AND across tokens
+        where_and = " AND ".join([f"{haystack} LIKE ?" for _ in tokens])
+        total = con.execute(f"SELECT COUNT(*) FROM items WHERE {where_and}", like_params).fetchone()[0]
+
+        fuzzy = False
+        if total > 0:
+            rows = con.execute(
+                f"SELECT id, album_id, artist, title, album, year, path, "
+                f"       {score_expr} AS score "
+                f"FROM items WHERE {where_and} "
+                f"ORDER BY score DESC, artist, album, track "
+                f"LIMIT ? OFFSET ?",
+                [first_like, first_like, first_like, *like_params,
+                 DEL_PAGE_SIZE, page * DEL_PAGE_SIZE]).fetchall()
+        elif len(tokens) >= 2:
+            # Fuzzy pass: OR across tokens, rank by hit count + field weight
+            fuzzy = True
+            where_or = " OR ".join([f"{haystack} LIKE ?" for _ in tokens])
+            hit_count = " + ".join([f"(CASE WHEN {haystack} LIKE ? THEN 1 ELSE 0 END)"
+                                    for _ in tokens])
+            fuzzy_score = f"({hit_count}) * 10 + {score_expr}"
+            params = [
+                *like_params,                     # hit_count CASE
+                first_like, first_like, first_like,  # score_expr
+                *like_params,                     # WHERE OR
+                DEL_PAGE_SIZE, page * DEL_PAGE_SIZE,
+            ]
+            total = con.execute(
+                f"SELECT COUNT(*) FROM items WHERE {where_or}", like_params).fetchone()[0]
+            rows = con.execute(
+                f"SELECT id, album_id, artist, title, album, year, path, "
+                f"       {fuzzy_score} AS score "
+                f"FROM items WHERE {where_or} "
+                f"ORDER BY score DESC, artist, album, track "
+                f"LIMIT ? OFFSET ?",
+                params).fetchall()
+        else:
+            rows = []
+
         con.close()
     except Exception as e:
         log.warning("[del] beets query failed: %s", e)
-        return [], 0
-    # Drop the trailing score column before returning
-    return [_row_to_track(r[:7]) for r in rows], total
+        return [], 0, False
+    return [_row_to_track(r[:7]) for r in rows], total, fuzzy
 
 
 def _beets_album_tracks(album_id: int) -> list:
@@ -4405,7 +4442,7 @@ def _handle_delete_query(chat_id, query):
         tg_send(chat_id, "Empty query. Tap 🗑 Delete Tracks to try again.",
                 reply_markup=TG_LIBRARY_KB)
         return
-    results, total = _beets_search(query, page=0)
+    results, total, fuzzy = _beets_search(query, page=0)
     if not results:
         tg_send(chat_id, f"❌ No matches for `{_esc(query)}` in your library.",
                 reply_markup=TG_LIBRARY_KB)
@@ -4424,6 +4461,7 @@ def _handle_delete_query(chat_id, query):
         "page":            0,
         "pages":           pages,
         "total":           total,
+        "fuzzy":           fuzzy,
         "selected":        set(),
         "selected_albums": set(),
     }
@@ -4446,9 +4484,12 @@ def _selected_count(session) -> int:
 
 
 def _render_del_results(session):
-    text_lines = [f"🗑 *Delete Tracks* — `{_esc(session['query'])}`",
-                  f"Found *{session['total']}* match(es) · page {session['page']+1}/{session['pages']}",
-                  ""]
+    text_lines = [f"🗑 *Delete Tracks* — `{_esc(session['query'])}`"]
+    if session.get("fuzzy"):
+        text_lines.append(f"⚠️ _No exact match — showing *{session['total']}* partial hit(s)_")
+    else:
+        text_lines.append(f"Found *{session['total']}* match(es) · page {session['page']+1}/{session['pages']}")
+    text_lines.append("")
     sel_n = _selected_count(session)
     rows = []
     for i, r in enumerate(session["results"]):
