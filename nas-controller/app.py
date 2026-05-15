@@ -3696,6 +3696,17 @@ def handle_callback(cq: dict):
             return
         pick = s["candidates"][s.get("picked", 0)]
         def _do_add():
+            # IMDb-sourced picks don't have a tmdb_id yet — Watcharr needs one
+            if not pick.get("tmdb_id"):
+                try:
+                    _tg_call("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
+                             reply_markup=json.dumps({"inline_keyboard": []}))
+                except Exception: pass
+                if not _resolve_tmdb_id(pick):
+                    tg_send(chat_id,
+                            "❌ Couldn't resolve a TMDB id for this title — Watcharr "
+                            "stores items by TMDB id, so I can't add it. Try a different match.")
+                    return
             ok, body = _wl_add(pick["tmdb_id"], pick["kind"], status="PLANNED")
             if ok:
                 # Edit the existing message caption to "✅ Added"
@@ -5520,6 +5531,8 @@ GEMINI_BASE               = "https://generativelanguage.googleapis.com/v1beta"
 TMDB_API_KEY              = os.getenv("TMDB_API_KEY", "")
 TMDB_BASE                 = "https://api.themoviedb.org/3"
 TMDB_IMG_W500             = "https://image.tmdb.org/t/p/w500"
+OMDB_API_KEY              = os.getenv("OMDB_API_KEY", "")
+OMDB_BASE                 = "https://www.omdbapi.com"
 WATCHARR_URL              = os.getenv("WATCHARR_URL", "http://host.docker.internal:3201")
 WATCHARR_TOKEN            = os.getenv("WATCHARR_TOKEN", "")
 FIND_CONFIDENCE_AUTO_PICK = 0.85
@@ -5767,6 +5780,129 @@ def _gemini_video_pass(file_uri: str, mime: str = "video/mp4") -> dict | None:
         log.warning("[find] Gemini video parse failed: %s", e); return None
 
 
+def _omdb_request(**params) -> dict | None:
+    """OMDb is the IMDb-data proxy used as the primary identity source."""
+    if not OMDB_API_KEY:
+        return None
+    params["apikey"] = OMDB_API_KEY
+    params.setdefault("plot", "short")
+    url = f"{OMDB_BASE}/?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        log.warning("[find] OMDb failed: %s", e); return None
+    if data.get("Response") != "True":
+        log.info("[find] OMDb miss: %s", data.get("Error", ""))
+        return None
+    return data
+
+
+def _omdb_normalize(raw: dict, fallback_kind: str = "movie") -> dict:
+    """Map OMDb payload to the shared Candidate shape used by Find Infos.
+
+    tmdb_id is set later via _resolve_tmdb_id once we commit to this candidate
+    (only that lookup is needed for Watcharr add)."""
+    year_str = (raw.get("Year") or "")[:4]
+    year = int(year_str) if year_str.isdigit() else None
+    typ = (raw.get("Type") or fallback_kind).lower()
+    kind = "tv" if typ in ("series", "episode", "miniseries") else "movie"
+    poster = raw.get("Poster") or ""
+    if poster == "N/A":
+        poster = ""
+    rating_str = raw.get("imdbRating") or ""
+    try:
+        rating = round(float(rating_str), 1) if rating_str not in ("", "N/A") else 0.0
+    except ValueError:
+        rating = 0.0
+    votes_str = (raw.get("imdbVotes") or "").replace(",", "")
+    try:
+        votes = int(votes_str) if votes_str not in ("", "N/A") else 0
+    except ValueError:
+        votes = 0
+    overview = raw.get("Plot") or ""
+    if overview == "N/A":
+        overview = ""
+    return {
+        "source":      "imdb",
+        "imdb_id":     raw.get("imdbID") or "",
+        "tmdb_id":     None,                                       # filled later if user adds
+        "kind":        kind,
+        "title":       raw.get("Title") or "",
+        "original":    raw.get("Title") or "",
+        "year":        year,
+        "overview":    overview,
+        "rating":      rating,
+        "vote_count":  votes,
+        "poster_path": None,
+        "poster_url":  poster or None,
+        "tmdb_page":   "",                                          # filled later if known
+        "imdb_page":   f"https://www.imdb.com/title/{raw.get('imdbID')}" if raw.get("imdbID") else "",
+        "genre":       raw.get("Genre") or "",
+        "runtime":     raw.get("Runtime") or "",
+    }
+
+
+def _omdb_search(title: str, year: int | None, kind: str) -> list[dict]:
+    """Title-based OMDb lookup. Returns 0..3 candidates."""
+    if not title or not OMDB_API_KEY:
+        return []
+    omdb_type = "series" if kind == "tv" else ("movie" if kind == "movie" else "")
+    # Try the precise t= lookup first (single best match)
+    params = {"t": title}
+    if year:
+        params["y"] = year
+    if omdb_type:
+        params["type"] = omdb_type
+    primary = _omdb_request(**params)
+    if primary:
+        return [_omdb_normalize(primary, fallback_kind=kind)]
+    # Drop year filter and retry once before giving up
+    if year:
+        params.pop("y", None)
+        primary = _omdb_request(**params)
+        if primary:
+            return [_omdb_normalize(primary, fallback_kind=kind)]
+    # Drop type filter as last resort
+    if omdb_type:
+        params.pop("type", None)
+        primary = _omdb_request(**params)
+        if primary:
+            return [_omdb_normalize(primary)]
+    return []
+
+
+def _resolve_tmdb_id(candidate: dict) -> int | None:
+    """Given an IMDb-sourced candidate, look up the matching TMDB id needed for
+    Watcharr add. Uses TMDB's /find/{imdb_id} reverse-lookup."""
+    if candidate.get("tmdb_id"):
+        return candidate["tmdb_id"]
+    imdb_id = candidate.get("imdb_id")
+    if not imdb_id:
+        return None
+    res = _tmdb_request(f"/find/{imdb_id}", external_source="imdb_id")
+    if not res:
+        return None
+    kind = candidate.get("kind", "movie")
+    bucket = "movie_results" if kind == "movie" else "tv_results"
+    hits = res.get(bucket) or []
+    if not hits:
+        # Bucket flip: imdb_id might be tagged as movie when it's tv (or vice versa)
+        other = "tv_results" if bucket == "movie_results" else "movie_results"
+        hits = res.get(other) or []
+        if hits:
+            candidate["kind"] = "tv" if other == "tv_results" else "movie"
+    if not hits:
+        return None
+    tmdb_id = hits[0].get("id")
+    candidate["tmdb_id"]   = tmdb_id
+    candidate["tmdb_page"] = f"https://www.themoviedb.org/{candidate['kind']}/{tmdb_id}"
+    # If OMDb didn't give a poster, borrow TMDB's
+    if not candidate.get("poster_url") and hits[0].get("poster_path"):
+        candidate["poster_url"] = f"{TMDB_IMG_W500}{hits[0]['poster_path']}"
+    return tmdb_id
+
+
 def _tmdb_request(path: str, **params) -> dict | None:
     if not TMDB_API_KEY:
         return None
@@ -5790,6 +5926,8 @@ def _tmdb_normalize(raw: dict, kind: str) -> dict:
     year  = int(date[:4]) if date[:4].isdigit() else None
     poster = raw.get("poster_path")
     return {
+        "source":      "tmdb",
+        "imdb_id":     "",
         "tmdb_id":     raw.get("id"),
         "kind":        kind,
         "title":       title,
@@ -5801,6 +5939,7 @@ def _tmdb_normalize(raw: dict, kind: str) -> dict:
         "poster_path": poster,
         "poster_url":  f"{TMDB_IMG_W500}{poster}" if poster else None,
         "tmdb_page":   f"https://www.themoviedb.org/{kind}/{raw.get('id')}",
+        "imdb_page":   "",
     }
 
 
@@ -5847,26 +5986,35 @@ def _render_find_info(candidate: dict, source_url: str = "",
                       show_pick_again: bool = False) -> tuple[str, str | None, str]:
     """Return (caption_text, poster_url, inline_kb_json) for the info card."""
     kind_label = "🎬 Movie" if candidate["kind"] == "movie" else "📺 TV Show"
-    rating = f"⭐ {candidate['rating']}/10" if candidate["rating"] else "_no rating yet_"
+    src = candidate.get("source", "tmdb")
+    rating_label = f"⭐ {candidate['rating']}/10 (IMDb)" if src == "imdb" else f"⭐ {candidate['rating']}/10 (TMDB)"
+    if not candidate["rating"]:
+        rating_label = "_no rating yet_"
     overview = candidate["overview"][:600]
     if len(candidate["overview"]) > 600:
         overview = overview.rstrip() + "…"
     lines = [
         f"*{_esc(candidate['title'])}* ({candidate['year'] or '????'})",
-        f"{kind_label}  ·  {rating}",
-        "",
-        _esc(overview) if overview else "_no overview available_",
+        f"{kind_label}  ·  {rating_label}",
     ]
+    if candidate.get("genre"):
+        lines.append(f"_{_esc(candidate['genre'])}_")
+    lines += ["", _esc(overview) if overview else "_no overview available_"]
     if source_url:
         host = urllib.parse.urlparse(source_url).netloc
         lines.append(f"\n_Source: {host}_")
-    rows = [
-        [{"text": "➕ Add to watchlist", "callback_data": "find:add"}],
-    ]
+
+    rows = [[{"text": "➕ Add to watchlist", "callback_data": "find:add"}]]
     if show_pick_again:
         rows.append([{"text": "🔍 Wrong match? Pick another", "callback_data": "find:back_to_picker"}])
-    rows.append([{"text": "🔗 Open TMDB",   "url": candidate["tmdb_page"]}])
-    rows.append([{"text": "❌ Cancel",      "callback_data": "find:cancel"}])
+    link_row = []
+    if candidate.get("imdb_page"):
+        link_row.append({"text": "🔗 IMDb", "url": candidate["imdb_page"]})
+    if candidate.get("tmdb_page"):
+        link_row.append({"text": "🔗 TMDB", "url": candidate["tmdb_page"]})
+    if link_row:
+        rows.append(link_row)
+    rows.append([{"text": "❌ Cancel", "callback_data": "find:cancel"}])
     return "\n".join(lines), candidate.get("poster_url"), _inline(rows)
 
 
@@ -5987,12 +6135,15 @@ def _handle_find_url(chat_id: int, url: str):
                     f"the clip.\n\nReasoning: _{_esc(video.get('reasoning',''))[:200]}_")
             return
 
-    # Stage 3: TMDB search
-    tg_edit(chat_id, msg_id, f"🔎 Searching TMDB for *{_esc(title)}*…")
-    candidates = _tmdb_search(kind if kind in ("movie","tv") else "movie", title, year)
+    # Stage 3: identity lookup — OMDb (IMDb) primary, TMDB fallback
+    tg_edit(chat_id, msg_id, f"🔎 Searching IMDb for *{_esc(title)}*…")
+    candidates = _omdb_search(title, year, kind if kind in ("movie","tv") else "movie")
+    if not candidates:
+        tg_edit(chat_id, msg_id, f"🔎 Not on IMDb — falling back to TMDB for *{_esc(title)}*…")
+        candidates = _tmdb_search(kind if kind in ("movie","tv") else "movie", title, year)
     if not candidates:
         tg_edit(chat_id, msg_id,
-                f"🤷 Gemini found `{_esc(title)}` but TMDB has no match.")
+                f"🤷 Gemini found `{_esc(title)}` but neither IMDb nor TMDB has a match.")
         return
 
     # Build session
