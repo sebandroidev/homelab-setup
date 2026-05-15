@@ -5635,12 +5635,20 @@ def _gemini_text_pass(meta: dict) -> dict | None:
         "- Strip caption noise that is NOT part of the title (e.g. 'now playing on "
         "Netflix', emoji, hashtags, '#movie', uploader handles).\n"
         "- If the metadata explicitly quotes the title or the upload comes from an "
-        "official studio/streamer account, trust that wording.\n\n"
+        "official studio/streamer account, trust that wording.\n"
+        "- For anime: prefer the English title used internationally (e.g. 'Attack on "
+        "Titan' over 'Shingeki no Kyojin', 'My Hero Academia' over 'Boku no Hero "
+        "Academia'). Romaji is acceptable when no English title exists.\n"
+        "- Set is_anime=true ONLY for Japanese animated series/films (anime). "
+        "Western animation (Disney, Pixar, Cartoon Network) is NOT anime. "
+        "Examples of anime: One Piece, Naruto, Demon Slayer, Spirited Away, "
+        "Attack on Titan, Death Note, Cowboy Bebop, Your Name.\n\n"
         "Respond with JSON in this exact schema:\n"
         "{\n"
         '  "kind": "movie" | "tv" | "unknown",\n'
         '  "title": "string (canonical title verbatim, no caption noise)",\n'
         '  "year": integer or null,\n'
+        '  "is_anime": boolean,\n'
         '  "confidence": number from 0.0 to 1.0,\n'
         '  "reasoning": "one short sentence"\n'
         "}"
@@ -5784,12 +5792,20 @@ def _gemini_video_pass(file_uri: str, mime: str = "video/mp4") -> dict | None:
     if not GEMINI_API_KEY or not file_uri:
         return None
     prompt = (
-        "Identify the movie or TV show shown in this video clip.\n\n"
+        "Identify the movie, TV show, or anime shown in this video clip.\n\n"
+        "Rules:\n"
+        "- Preserve the complete canonical title verbatim (including unusual "
+        "punctuation/interjections).\n"
+        "- For anime, prefer the international English title (e.g. 'Attack on "
+        "Titan' over 'Shingeki no Kyojin').\n"
+        "- Set is_anime=true ONLY for Japanese animated series/films. Western "
+        "animation (Disney, Pixar) is NOT anime.\n\n"
         "Respond with JSON in this exact schema:\n"
         "{\n"
         '  "kind": "movie" | "tv" | "unknown",\n'
         '  "title": "string (canonical title)",\n'
         '  "year": integer or null,\n'
+        '  "is_anime": boolean,\n'
         '  "confidence": number 0.0-1.0,\n'
         '  "reasoning": "one short sentence"\n'
         "}"
@@ -5825,6 +5841,169 @@ def _gemini_video_pass(file_uri: str, mime: str = "video/mp4") -> dict | None:
         return parsed
     except Exception as e:
         log.warning("[find] Gemini video parse failed: %s", e); return None
+
+
+# ── AniList (anime DB, GraphQL) ──────────────────────────────────────────────
+ANILIST_URL = "https://graphql.anilist.co"
+_ANILIST_QUERY = """
+query ($s: String, $y: Int) {
+  Page(perPage: 5) {
+    media(search: $s, type: ANIME, seasonYear: $y, sort: SEARCH_MATCH) {
+      id idMal
+      title { romaji english native }
+      format episodes seasonYear averageScore description(asHtml: false)
+      coverImage { large }
+      genres siteUrl
+    }
+  }
+}
+"""
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(s: str) -> str:
+    return _HTML_TAG_RE.sub("", s or "").strip()
+
+
+def _anilist_normalize(raw: dict) -> dict:
+    titles = raw.get("title") or {}
+    title  = titles.get("english") or titles.get("romaji") or titles.get("native") or ""
+    fmt    = (raw.get("format") or "").upper()
+    kind   = "movie" if fmt == "MOVIE" else "tv"
+    score  = raw.get("averageScore")
+    rating = round(score / 10.0, 1) if score else 0.0
+    poster = (raw.get("coverImage") or {}).get("large")
+    return {
+        "source":      "anilist",
+        "imdb_id":     "",
+        "tmdb_id":     None,
+        "anilist_id":  raw.get("id"),
+        "mal_id":      raw.get("idMal"),
+        "kind":        kind,
+        "title":       title,
+        "original":    titles.get("native") or title,
+        "year":        raw.get("seasonYear"),
+        "overview":    _strip_html(raw.get("description") or ""),
+        "rating":      rating,
+        "vote_count":  0,
+        "poster_path": None,
+        "poster_url":  poster,
+        "tmdb_page":   "",
+        "imdb_page":   "",
+        "anilist_page": raw.get("siteUrl") or "",
+        "genre":       ", ".join(raw.get("genres") or [])[:80],
+        "runtime":     f"{raw.get('episodes')} ep" if raw.get("episodes") else "",
+    }
+
+
+def _anilist_search(title: str, year: int | None) -> list[dict]:
+    if not title:
+        return []
+    body = {"query": _ANILIST_QUERY, "variables": {"s": title}}
+    if year:
+        body["variables"]["y"] = year
+    try:
+        req = urllib.request.Request(ANILIST_URL,
+                                     data=json.dumps(body).encode(),
+                                     method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and year:
+            # AniList year filter is strict — retry without it
+            body["variables"].pop("y", None)
+            try:
+                req = urllib.request.Request(ANILIST_URL,
+                                             data=json.dumps(body).encode(),
+                                             method="POST",
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    res = json.loads(r.read())
+            except Exception as e2:
+                log.warning("[find] AniList retry failed: %s", e2); return []
+        else:
+            log.warning("[find] AniList HTTP %d", e.code); return []
+    except Exception as e:
+        log.warning("[find] AniList exception: %s", e); return []
+    media = (res.get("data") or {}).get("Page", {}).get("media") or []
+    if not media and year:
+        # Year filter struck out — retry without it
+        body["variables"].pop("y", None)
+        try:
+            req = urllib.request.Request(ANILIST_URL,
+                                         data=json.dumps(body).encode(),
+                                         method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                res = json.loads(r.read())
+            media = (res.get("data") or {}).get("Page", {}).get("media") or []
+        except Exception:
+            pass
+    return [_anilist_normalize(m) for m in media[:5]]
+
+
+# ── Jikan (MyAnimeList, REST) ────────────────────────────────────────────────
+JIKAN_BASE = "https://api.jikan.moe/v4"
+
+
+def _jikan_normalize(raw: dict) -> dict:
+    typ = (raw.get("type") or "").lower()
+    kind = "movie" if typ == "movie" else "tv"
+    title = raw.get("title_english") or raw.get("title") or ""
+    score = raw.get("score") or 0
+    poster = ((raw.get("images") or {}).get("jpg") or {}).get("large_image_url") or \
+             ((raw.get("images") or {}).get("webp") or {}).get("large_image_url")
+    return {
+        "source":      "mal",
+        "imdb_id":     "",
+        "tmdb_id":     None,
+        "mal_id":      raw.get("mal_id"),
+        "anilist_id":  None,
+        "kind":        kind,
+        "title":       title,
+        "original":    raw.get("title_japanese") or raw.get("title") or title,
+        "year":        raw.get("year"),
+        "overview":    raw.get("synopsis") or "",
+        "rating":      round(float(score), 1) if score else 0.0,
+        "vote_count":  raw.get("scored_by") or 0,
+        "poster_path": None,
+        "poster_url":  poster,
+        "tmdb_page":   "",
+        "imdb_page":   "",
+        "mal_page":    raw.get("url") or "",
+        "genre":       ", ".join(g.get("name","") for g in (raw.get("genres") or []))[:80],
+        "runtime":     f"{raw.get('episodes')} ep" if raw.get("episodes") else "",
+    }
+
+
+def _jikan_search(title: str, year: int | None) -> list[dict]:
+    if not title:
+        return []
+    params = {"q": title, "limit": 5, "order_by": "score", "sort": "desc"}
+    if year:
+        params["start_date"] = f"{year}-01-01"
+        params["end_date"]   = f"{year}-12-31"
+    url = f"{JIKAN_BASE}/anime?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            res = json.loads(r.read())
+    except Exception as e:
+        log.warning("[find] Jikan exception: %s", e); return []
+    data = res.get("data") or []
+    if not data and year:
+        # Drop year filter
+        params = {"q": title, "limit": 5, "order_by": "score", "sort": "desc"}
+        url = f"{JIKAN_BASE}/anime?" + urllib.parse.urlencode(params)
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                res = json.loads(r.read())
+            data = res.get("data") or []
+        except Exception:
+            pass
+    return [_jikan_normalize(d) for d in data[:5]]
 
 
 def _omdb_request(**params) -> dict | None:
@@ -5945,34 +6124,60 @@ def _omdb_search(title: str, year: int | None, kind: str) -> list[dict]:
 
 
 def _resolve_tmdb_id(candidate: dict) -> int | None:
-    """Given an IMDb-sourced candidate, look up the matching TMDB id needed for
-    Watcharr add. Uses TMDB's /find/{imdb_id} reverse-lookup."""
+    """Resolve the candidate's tmdb_id needed for Watcharr add.
+
+    Three strategies (first hit wins):
+      1. Candidate already has tmdb_id (TMDB-sourced)
+      2. Has imdb_id (OMDb-sourced) → TMDB /find/{imdb_id} reverse lookup
+      3. Title-based fallback (AniList / Jikan) → TMDB /search/{kind}?query=title
+    """
     if candidate.get("tmdb_id"):
         return candidate["tmdb_id"]
+
+    # Strategy 2: by imdb_id
     imdb_id = candidate.get("imdb_id")
-    if not imdb_id:
+    if imdb_id:
+        res = _tmdb_request(f"/find/{imdb_id}", external_source="imdb_id")
+        if res:
+            kind = candidate.get("kind", "movie")
+            bucket = "movie_results" if kind == "movie" else "tv_results"
+            hits = res.get(bucket) or []
+            if not hits:
+                other = "tv_results" if bucket == "movie_results" else "movie_results"
+                hits = res.get(other) or []
+                if hits:
+                    candidate["kind"] = "tv" if other == "tv_results" else "movie"
+            if hits:
+                tmdb_id = hits[0].get("id")
+                candidate["tmdb_id"]   = tmdb_id
+                candidate["tmdb_page"] = f"https://www.themoviedb.org/{candidate['kind']}/{tmdb_id}"
+                if not candidate.get("poster_url") and hits[0].get("poster_path"):
+                    candidate["poster_url"] = f"{TMDB_IMG_W500}{hits[0]['poster_path']}"
+                return tmdb_id
+
+    # Strategy 3: by title (anime sources have no imdb_id)
+    title = candidate.get("title")
+    year  = candidate.get("year")
+    kind  = candidate.get("kind", "tv")
+    if not title:
         return None
-    res = _tmdb_request(f"/find/{imdb_id}", external_source="imdb_id")
-    if not res:
+    tmdb_hits = _tmdb_search(kind, title, year)
+    if not tmdb_hits and year:
+        tmdb_hits = _tmdb_search(kind, title, None)
+    # Try the OTHER kind if first attempt empty (some movies misclassified as tv)
+    if not tmdb_hits:
+        other = "tv" if kind == "movie" else "movie"
+        tmdb_hits = _tmdb_search(other, title, year)
+        if tmdb_hits:
+            candidate["kind"] = other
+    if not tmdb_hits:
         return None
-    kind = candidate.get("kind", "movie")
-    bucket = "movie_results" if kind == "movie" else "tv_results"
-    hits = res.get(bucket) or []
-    if not hits:
-        # Bucket flip: imdb_id might be tagged as movie when it's tv (or vice versa)
-        other = "tv_results" if bucket == "movie_results" else "movie_results"
-        hits = res.get(other) or []
-        if hits:
-            candidate["kind"] = "tv" if other == "tv_results" else "movie"
-    if not hits:
-        return None
-    tmdb_id = hits[0].get("id")
-    candidate["tmdb_id"]   = tmdb_id
-    candidate["tmdb_page"] = f"https://www.themoviedb.org/{candidate['kind']}/{tmdb_id}"
-    # If OMDb didn't give a poster, borrow TMDB's
-    if not candidate.get("poster_url") and hits[0].get("poster_path"):
-        candidate["poster_url"] = f"{TMDB_IMG_W500}{hits[0]['poster_path']}"
-    return tmdb_id
+    best = tmdb_hits[0]
+    candidate["tmdb_id"]   = best["tmdb_id"]
+    candidate["tmdb_page"] = best["tmdb_page"]
+    if not candidate.get("poster_url") and best.get("poster_url"):
+        candidate["poster_url"] = best["poster_url"]
+    return best["tmdb_id"]
 
 
 def _tmdb_request(path: str, **params) -> dict | None:
@@ -6059,9 +6264,10 @@ def _render_find_info(candidate: dict, source_url: str = "",
     """Return (caption_text, poster_url, inline_kb_json) for the info card."""
     kind_label = "🎬 Movie" if candidate["kind"] == "movie" else "📺 TV Show"
     src = candidate.get("source", "tmdb")
-    rating_label = f"⭐ {candidate['rating']}/10 (IMDb)" if src == "imdb" else f"⭐ {candidate['rating']}/10 (TMDB)"
-    if not candidate["rating"]:
-        rating_label = "_no rating yet_"
+    src_label = {"imdb": "IMDb", "anilist": "AniList", "mal": "MAL",
+                  "tmdb": "TMDB"}.get(src, src.upper())
+    rating_label = (f"⭐ {candidate['rating']}/10 ({src_label})"
+                     if candidate["rating"] else "_no rating yet_")
     overview = candidate["overview"][:600]
     if len(candidate["overview"]) > 600:
         overview = overview.rstrip() + "…"
@@ -6083,10 +6289,18 @@ def _render_find_info(candidate: dict, source_url: str = "",
     link_row = []
     if candidate.get("imdb_page"):
         link_row.append({"text": "🔗 IMDb", "url": candidate["imdb_page"]})
+    if candidate.get("anilist_page"):
+        link_row.append({"text": "🔗 AniList", "url": candidate["anilist_page"]})
+    if candidate.get("mal_page"):
+        link_row.append({"text": "🔗 MAL", "url": candidate["mal_page"]})
     if candidate.get("tmdb_page"):
         link_row.append({"text": "🔗 TMDB", "url": candidate["tmdb_page"]})
     if link_row:
-        rows.append(link_row)
+        # Telegram inline kb caps at ~4 buttons per row comfortably; split if needed
+        if len(link_row) > 3:
+            rows.append(link_row[:3]); rows.append(link_row[3:])
+        else:
+            rows.append(link_row)
     rows.append([{"text": "❌ Cancel", "callback_data": "find:cancel"}])
     return "\n".join(lines), candidate.get("poster_url"), _inline(rows)
 
@@ -6144,12 +6358,17 @@ def _handle_find_refine(chat_id: int, query: str):
     prior = (s.get("gemini") or {}).get("kind") or "movie"
     kind  = prior if prior in ("movie", "tv") else "movie"
 
-    candidates = _omdb_search(query, None, kind)
+    is_anime = bool((s.get("gemini") or {}).get("is_anime"))
+    candidates: list[dict] = []
+    if is_anime:
+        candidates = _anilist_search(query, None) or _jikan_search(query, None)
+    if not candidates:
+        candidates = _omdb_search(query, None, kind)
     if not candidates:
         tg_edit(chat_id, msg_id, f"🔎 Not on IMDb — trying TMDB for *{_esc(query)}*…")
         candidates = _tmdb_search(kind, query, None)
     if not candidates:
-        tg_edit(chat_id, msg_id, f"🤷 No match for `{_esc(query)}` on IMDb or TMDB.")
+        tg_edit(chat_id, msg_id, f"🤷 No match for `{_esc(query)}` anywhere.")
         return
 
     new_session = {
@@ -6280,15 +6499,29 @@ def _handle_find_url(chat_id: int, url: str):
                     f"the clip.\n\nReasoning: _{_esc(video.get('reasoning',''))[:200]}_")
             return
 
-    # Stage 3: identity lookup — OMDb (IMDb) primary, TMDB fallback
-    tg_edit(chat_id, msg_id, f"🔎 Searching IMDb for *{_esc(title)}*…")
-    candidates = _omdb_search(title, year, kind if kind in ("movie","tv") else "movie")
+    # Stage 3: identity lookup — cascade depends on whether Gemini flagged anime
+    is_anime = bool(gemini.get("is_anime"))
+    safe_kind = kind if kind in ("movie","tv") else "movie"
+    candidates: list[dict] = []
+    if is_anime:
+        tg_edit(chat_id, msg_id, f"🎌 Searching AniList for *{_esc(title)}*…")
+        candidates = _anilist_search(title, year)
+        if not candidates:
+            tg_edit(chat_id, msg_id, f"🎌 Not on AniList — trying MyAnimeList for *{_esc(title)}*…")
+            candidates = _jikan_search(title, year)
+        if not candidates:
+            tg_edit(chat_id, msg_id, f"🎌 Anime DBs empty — falling back to IMDb for *{_esc(title)}*…")
+            candidates = _omdb_search(title, year, safe_kind)
+    else:
+        tg_edit(chat_id, msg_id, f"🔎 Searching IMDb for *{_esc(title)}*…")
+        candidates = _omdb_search(title, year, safe_kind)
     if not candidates:
         tg_edit(chat_id, msg_id, f"🔎 Not on IMDb — falling back to TMDB for *{_esc(title)}*…")
-        candidates = _tmdb_search(kind if kind in ("movie","tv") else "movie", title, year)
+        candidates = _tmdb_search(safe_kind, title, year)
     if not candidates:
+        sources = "AniList, MAL, IMDb or TMDB" if is_anime else "IMDb or TMDB"
         tg_edit(chat_id, msg_id,
-                f"🤷 Gemini found `{_esc(title)}` but neither IMDb nor TMDB has a match.")
+                f"🤷 Gemini found `{_esc(title)}` but no match on {sources}.")
         return
 
     # Build session
