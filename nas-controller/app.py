@@ -3648,6 +3648,59 @@ def handle_callback(cq: dict):
         threading.Thread(target=_empty_trash_preview, args=(chat_id, msg_id), daemon=True).start()
         return
 
+    # ── Find Infos callbacks ──────────────────────────────────────────────────
+    if data == "find:cancel":
+        msg_id = cq.get("message", {}).get("message_id")
+        with _find_lock:
+            _find_session.pop(chat_id, None)
+        _find_pending.discard(chat_id)
+        if msg_id:
+            try: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+            except Exception: pass
+        tg_send(chat_id, "Cancelled.", reply_markup=TG_MEDIA_KB)
+        return
+
+    if data.startswith("find:pick:"):
+        idx = int(data.rsplit(":", 1)[1])
+        s = _find_session_get(chat_id)
+        if not s or idx >= len(s.get("candidates", [])):
+            tg_send(chat_id, "⏰ Session expired."); return
+        s["picked"] = idx
+        msg_id = cq.get("message", {}).get("message_id")
+        new_id = _send_or_edit_info_card(chat_id, s["candidates"][idx],
+                                          s["url"], show_pick_again=True,
+                                          old_msg_id=msg_id)
+        if new_id:
+            s["msg_id"] = new_id
+        _find_session_set(chat_id, s)
+        return
+
+    if data == "find:back_to_picker":
+        s = _find_session_get(chat_id)
+        if not s: return
+        msg_id = cq.get("message", {}).get("message_id")
+        if msg_id:
+            try: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+            except Exception: pass
+        text, kb = _render_find_picker(s)
+        res = tg_send(chat_id, text, reply_markup=kb)
+        s["msg_id"] = (res or {}).get("result", {}).get("message_id")
+        _find_session_set(chat_id, s)
+        return
+
+    if data == "find:add":
+        # Watcharr wire-up lands in commit 6 — for now, surface a placeholder.
+        msg_id = cq.get("message", {}).get("message_id")
+        s = _find_session_get(chat_id)
+        if not s:
+            tg_send(chat_id, "⏰ Session expired."); return
+        pick = s["candidates"][s.get("picked", 0)]
+        tg_send(chat_id,
+                f"🚧 Add-to-watchlist wires up in commit 6.\n"
+                f"Would add: *{_esc(pick['title'])}* ({pick['year']}) "
+                f"[{pick['kind']}/{pick['tmdb_id']}]")
+        return
+
     if data == "nas:trash:empty:confirm":
         msg_id = cq.get("message", {}).get("message_id")
         threading.Thread(target=_empty_trash_execute, args=(chat_id, msg_id), daemon=True).start()
@@ -5365,14 +5418,299 @@ def _handle_find_start(chat_id: int):
             "I'll identify the movie or TV show and look up its details.")
 
 
+def _ytdlp_metadata(url: str) -> dict | None:
+    """Run yt-dlp --dump-json and return a trimmed metadata dict."""
+    try:
+        r = subprocess.run(
+            ["python3", "-m", "yt_dlp", "--dump-json", "--no-warnings",
+             "--no-playlist", "--socket-timeout", "10", url],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            log.warning("[find] yt-dlp failed (%d): %s", r.returncode, r.stderr[:200])
+            return None
+        data = json.loads(r.stdout.splitlines()[0])
+    except Exception as e:
+        log.warning("[find] yt-dlp exception: %s", e)
+        return None
+    return {
+        "title":       data.get("title") or "",
+        "description": (data.get("description") or "")[:2000],
+        "uploader":    data.get("uploader") or data.get("channel") or "",
+        "tags":        data.get("tags") or [],
+        "categories":  data.get("categories") or [],
+        "duration":    data.get("duration"),
+        "webpage_url": data.get("webpage_url") or url,
+        "extractor":   data.get("extractor_key") or "",
+    }
+
+
+def _gemini_text_pass(meta: dict) -> dict | None:
+    """Send video metadata to Gemini and ask it to identify the movie/TV show."""
+    if not GEMINI_API_KEY:
+        return None
+    prompt = (
+        "Given this video's metadata from a clip-sharing site, identify the "
+        "movie or TV show featured in the video. The video is likely a fan edit, "
+        "trailer, scene compilation, or reaction.\n\n"
+        f"METADATA:\n```json\n{json.dumps(meta, ensure_ascii=False)[:3000]}\n```\n\n"
+        "Respond with JSON in this exact schema:\n"
+        "{\n"
+        '  "kind": "movie" | "tv" | "unknown",\n'
+        '  "title": "string (best guess at the canonical title)",\n'
+        '  "year": integer or null,\n'
+        '  "confidence": number from 0.0 to 1.0,\n'
+        '  "reasoning": "one short sentence"\n'
+        "}"
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+    }
+    try:
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": GEMINI_API_KEY},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        log.warning("[find] Gemini HTTP %d: %s", e.code, e.read()[:200])
+        return None
+    except Exception as e:
+        log.warning("[find] Gemini exception: %s", e)
+        return None
+    try:
+        txt = res["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(txt)
+        log.info("[find] Gemini: kind=%s title=%r year=%s conf=%.2f",
+                 parsed.get("kind"), parsed.get("title"),
+                 parsed.get("year"), parsed.get("confidence", 0))
+        return parsed
+    except Exception as e:
+        log.warning("[find] Gemini parse failed: %s | raw=%s", e, res)
+        return None
+
+
+def _tmdb_request(path: str, **params) -> dict | None:
+    if not TMDB_API_KEY:
+        return None
+    params["api_key"] = TMDB_API_KEY
+    params["language"] = "en-US"
+    url = f"{TMDB_BASE}{path}?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        log.warning("[find] TMDB %s HTTP %d", path, e.code)
+        return None
+    except Exception as e:
+        log.warning("[find] TMDB %s failed: %s", path, e)
+        return None
+
+
+def _tmdb_normalize(raw: dict, kind: str) -> dict:
+    title = raw.get("title") or raw.get("name") or ""
+    date  = raw.get("release_date") or raw.get("first_air_date") or ""
+    year  = int(date[:4]) if date[:4].isdigit() else None
+    poster = raw.get("poster_path")
+    return {
+        "tmdb_id":     raw.get("id"),
+        "kind":        kind,
+        "title":       title,
+        "original":    raw.get("original_title") or raw.get("original_name") or title,
+        "year":        year,
+        "overview":    raw.get("overview") or "",
+        "rating":      round(float(raw.get("vote_average") or 0), 1),
+        "vote_count":  raw.get("vote_count") or 0,
+        "poster_path": poster,
+        "poster_url":  f"{TMDB_IMG_W500}{poster}" if poster else None,
+        "tmdb_page":   f"https://www.themoviedb.org/{kind}/{raw.get('id')}",
+    }
+
+
+def _tmdb_search(kind: str, title: str, year: int | None) -> list[dict]:
+    if not title:
+        return []
+    if kind not in ("movie", "tv"):
+        # Search both, return interleaved
+        movies = _tmdb_search("movie", title, year)
+        shows  = _tmdb_search("tv",    title, year)
+        # Rank by vote_count, alternating
+        merged = []
+        for a, b in zip(movies, shows):
+            merged.append(a); merged.append(b)
+        merged.extend(movies[len(shows):]); merged.extend(shows[len(movies):])
+        return merged[:10]
+    params: dict = {"query": title, "include_adult": "false"}
+    if year:
+        params["primary_release_year" if kind == "movie" else "first_air_date_year"] = year
+    res = _tmdb_request(f"/search/{kind}", **params)
+    if not res or "results" not in res:
+        return []
+    return [_tmdb_normalize(r, kind) for r in res["results"][:10]]
+
+
+def _find_session_set(chat_id: int, session: dict):
+    session["expires_at"] = time.time() + FIND_SESSION_TTL
+    with _find_lock:
+        _find_session[chat_id] = session
+
+
+def _find_session_get(chat_id: int) -> dict | None:
+    with _find_lock:
+        s = _find_session.get(chat_id)
+        if not s:
+            return None
+        if time.time() > s.get("expires_at", 0):
+            _find_session.pop(chat_id, None)
+            return None
+        return s
+
+
+def _render_find_info(candidate: dict, source_url: str = "",
+                      show_pick_again: bool = False) -> tuple[str, str | None, str]:
+    """Return (caption_text, poster_url, inline_kb_json) for the info card."""
+    kind_label = "🎬 Movie" if candidate["kind"] == "movie" else "📺 TV Show"
+    rating = f"⭐ {candidate['rating']}/10" if candidate["rating"] else "_no rating yet_"
+    overview = candidate["overview"][:600]
+    if len(candidate["overview"]) > 600:
+        overview = overview.rstrip() + "…"
+    lines = [
+        f"*{_esc(candidate['title'])}* ({candidate['year'] or '????'})",
+        f"{kind_label}  ·  {rating}",
+        "",
+        _esc(overview) if overview else "_no overview available_",
+    ]
+    if source_url:
+        host = urllib.parse.urlparse(source_url).netloc
+        lines.append(f"\n_Source: {host}_")
+    rows = [
+        [{"text": "➕ Add to watchlist", "callback_data": "find:add"}],
+    ]
+    if show_pick_again:
+        rows.append([{"text": "🔍 Wrong match? Pick another", "callback_data": "find:back_to_picker"}])
+    rows.append([{"text": "🔗 Open TMDB",   "url": candidate["tmdb_page"]}])
+    rows.append([{"text": "❌ Cancel",      "callback_data": "find:cancel"}])
+    return "\n".join(lines), candidate.get("poster_url"), _inline(rows)
+
+
+def _render_find_picker(session: dict) -> tuple[str, str]:
+    cands = session["candidates"]
+    g = session.get("gemini") or {}
+    lines = [f"🔍 *Multiple matches* for `{_esc(g.get('title','?'))}`"]
+    if g.get("confidence"):
+        lines.append(f"_Gemini confidence: {g['confidence']:.0%}_")
+    lines.append("")
+    for i, c in enumerate(cands[:5]):
+        icon = "🎬" if c["kind"] == "movie" else "📺"
+        rating = f"⭐{c['rating']}" if c["rating"] else "—"
+        lines.append(f"{i+1}. {icon} *{_esc(c['title'])}* ({c['year'] or '?'}) {rating}")
+    rows = []
+    for i, c in enumerate(cands[:5]):
+        icon = "🎬" if c["kind"] == "movie" else "📺"
+        label = f"{i+1}. {icon} {c['title'][:35]} ({c['year'] or '?'})"
+        rows.append([{"text": label[:60], "callback_data": f"find:pick:{i}"}])
+    rows.append([{"text": "❌ Cancel", "callback_data": "find:cancel"}])
+    return "\n".join(lines), _inline(rows)
+
+
+def _send_or_edit_info_card(chat_id: int, candidate: dict, source_url: str,
+                              show_pick_again: bool, old_msg_id: int | None = None) -> int | None:
+    """Send (or replace) the info card. Returns new message_id."""
+    caption, poster_url, kb = _render_find_info(candidate, source_url, show_pick_again)
+    # Delete the placeholder/picker so the new sendPhoto replaces it
+    if old_msg_id:
+        try: _tg_call("deleteMessage", chat_id=chat_id, message_id=old_msg_id)
+        except Exception: pass
+    if poster_url:
+        res = _tg_call("sendPhoto", chat_id=chat_id, photo=poster_url,
+                       caption=caption, parse_mode="Markdown", reply_markup=kb)
+    else:
+        res = _tg_call("sendMessage", chat_id=chat_id, text=caption,
+                       parse_mode="Markdown", reply_markup=kb)
+    return (res or {}).get("result", {}).get("message_id")
+
+
 def _handle_find_url(chat_id: int, url: str):
-    """Pipeline stub — full implementation lands in commit 3."""
-    if not url.strip().startswith(("http://", "https://")):
+    """Hybrid extraction pipeline — daemon thread."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
         tg_send(chat_id, "❌ Not a valid URL. Tap 🔍 Find Infos to retry.",
                 reply_markup=TG_MEDIA_KB)
         return
-    tg_send(chat_id, "🚧 *Find Infos* pipeline lands in the next commit — your URL is `" +
-            _esc(url[:200]) + "`.", reply_markup=TG_MEDIA_KB)
+    if not GEMINI_API_KEY or not TMDB_API_KEY:
+        tg_send(chat_id, "❌ Find Infos needs `GEMINI_API_KEY` and `TMDB_API_KEY` in .env.")
+        return
+
+    host = urllib.parse.urlparse(url).netloc
+    placeholder = tg_send(chat_id, f"⏳ Looking up `{_esc(host)}`…",
+                          reply_markup=_inline([[{"text": "❌ Cancel",
+                                                   "callback_data": "find:cancel"}]]))
+    msg_id = (placeholder or {}).get("result", {}).get("message_id")
+
+    # Stage 1: yt-dlp metadata
+    tg_edit(chat_id, msg_id, f"⏳ Fetching metadata from `{_esc(host)}`…")
+    meta = _ytdlp_metadata(url)
+    if not meta:
+        tg_edit(chat_id, msg_id,
+                f"❌ Couldn't read metadata from `{_esc(host)}`.\n"
+                "Site may not be supported by yt-dlp, or the post is private/deleted.")
+        return
+
+    # Stage 2: Gemini text pass
+    tg_edit(chat_id, msg_id, "🤖 Asking Gemini to identify the media…")
+    gemini = _gemini_text_pass(meta)
+    if not gemini:
+        tg_edit(chat_id, msg_id, "❌ Gemini call failed (rate limit? bad key?). Check logs.")
+        return
+
+    kind, title = gemini.get("kind"), gemini.get("title")
+    conf = float(gemini.get("confidence") or 0)
+    year = gemini.get("year")
+
+    if kind == "unknown" or not title or conf < FIND_CONFIDENCE_ESCALATE:
+        # Video escalation lands in commit 4. For now, surface what we got.
+        tg_edit(chat_id, msg_id,
+                f"🤷 Gemini couldn't identify the media confidently "
+                f"(confidence {conf:.0%}).\n\n"
+                f"Best guess: _{_esc(title or '?')} ({year or '?'})_\n"
+                f"Reasoning: _{_esc(gemini.get('reasoning',''))[:200]}_\n\n"
+                "_Video escalation lands in commit 4._")
+        return
+
+    # Stage 3: TMDB search
+    tg_edit(chat_id, msg_id, f"🔎 Searching TMDB for *{_esc(title)}*…")
+    candidates = _tmdb_search(kind if kind in ("movie","tv") else "movie", title, year)
+    if not candidates:
+        tg_edit(chat_id, msg_id,
+                f"🤷 Gemini found `{_esc(title)}` but TMDB has no match.")
+        return
+
+    # Build session
+    session = {
+        "chat_id":    chat_id,
+        "url":        url,
+        "gemini":     gemini,
+        "candidates": candidates,
+        "picked":     0,
+        "msg_id":     msg_id,
+    }
+    _find_session_set(chat_id, session)
+
+    # Confidence-gated dispatch
+    if conf >= FIND_CONFIDENCE_AUTO_PICK and len(candidates) >= 1:
+        new_msg_id = _send_or_edit_info_card(chat_id, candidates[0], url,
+                                              show_pick_again=True, old_msg_id=msg_id)
+        if new_msg_id:
+            session["msg_id"] = new_msg_id
+            _find_session_set(chat_id, session)
+    else:
+        # Picker: show top-N
+        text, kb = _render_find_picker(session)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
 
 
 def _handle_watchlist_open(chat_id: int, msg_id: int | None = None,

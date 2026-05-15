@@ -21,6 +21,10 @@ services:
       - GENIUS_ACCESS_TOKEN=${GENIUS_ACCESS_TOKEN:-}
       - ORLY_JAMS_URL=http://host.docker.internal:7070
       - DEPLOY_SECRET=${DEPLOY_SECRET:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - WATCHARR_URL=${WATCHARR_URL:-http://host.docker.internal:3201}
+      - WATCHARR_TOKEN=${WATCHARR_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
