@@ -5984,7 +5984,8 @@ def _groq_text_pass(meta: dict, extra_context: str = "") -> dict | None:
             data=json.dumps(body).encode(),
             method="POST",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                     "Content-Type": "application/json"})
+                     "Content-Type": "application/json",
+                     "User-Agent": "nas-controller/1.0 (homelab)"})
         with urllib.request.urlopen(req, timeout=30) as r:
             res = json.loads(r.read())
     except urllib.error.HTTPError as e:
@@ -6050,7 +6051,8 @@ def _groq_whisper(audio_path: Path) -> str | None:
             data=data, method="POST",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}",
                      "Content-Type": f"multipart/form-data; boundary={boundary}",
-                     "Content-Length": str(len(data))})
+                     "Content-Length": str(len(data)),
+                     "User-Agent": "nas-controller/1.0 (homelab)"})
         with urllib.request.urlopen(req, timeout=60) as r:
             text = r.read().decode("utf-8", errors="replace").strip()
     except urllib.error.HTTPError as e:
