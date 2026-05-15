@@ -3689,16 +3689,61 @@ def handle_callback(cq: dict):
         return
 
     if data == "find:add":
-        # Watcharr wire-up lands in commit 6 — for now, surface a placeholder.
         msg_id = cq.get("message", {}).get("message_id")
         s = _find_session_get(chat_id)
         if not s:
-            tg_send(chat_id, "⏰ Session expired."); return
+            tg_send(chat_id, "⏰ Session expired. Tap 🔍 Find Infos to retry.")
+            return
         pick = s["candidates"][s.get("picked", 0)]
-        tg_send(chat_id,
-                f"🚧 Add-to-watchlist wires up in commit 6.\n"
-                f"Would add: *{_esc(pick['title'])}* ({pick['year']}) "
-                f"[{pick['kind']}/{pick['tmdb_id']}]")
+        def _do_add():
+            ok, body = _wl_add(pick["tmdb_id"], pick["kind"], status="PLANNED")
+            if ok:
+                # Edit the existing message caption to "✅ Added"
+                caption = (f"✅ *Added to watchlist*\n\n"
+                           f"*{_esc(pick['title'])}* ({pick['year'] or '?'}) "
+                           f"⭐ {pick['rating']}/10")
+                try:
+                    _tg_call("editMessageCaption", chat_id=chat_id, message_id=msg_id,
+                             caption=caption, parse_mode="Markdown",
+                             reply_markup=json.dumps({"inline_keyboard": []}))
+                except Exception:
+                    try: tg_edit(chat_id, msg_id, caption)
+                    except Exception: pass
+                with _find_lock:
+                    _find_session.pop(chat_id, None)
+            else:
+                err = "Already on watchlist" if body and "409" in str(body) else "API error"
+                tg_send(chat_id, f"❌ Add failed: {_esc(err)}")
+        threading.Thread(target=_do_add, daemon=True).start()
+        return
+
+    if data.startswith("wl:status:"):
+        parts = data.split(":")
+        wid    = int(parts[2])
+        status = parts[3]
+        msg_id = cq.get("message", {}).get("message_id")
+        def _do_status():
+            if _wl_update_status(wid, status):
+                _send_watchlist_item(chat_id, msg_id, wid)
+            else:
+                tg_send(chat_id, "❌ Status update failed.")
+        threading.Thread(target=_do_status, daemon=True).start()
+        return
+
+    if data.startswith("wl:remove:"):
+        wid = int(data.rsplit(":", 1)[1])
+        msg_id = cq.get("message", {}).get("message_id")
+        def _do_remove():
+            if not _wl_remove(wid):
+                tg_send(chat_id, "❌ Remove failed."); return
+            try: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+            except Exception: pass
+            s = _wl_session_get(chat_id) or {}
+            _handle_watchlist_open(chat_id, None,
+                                    s.get("status","all"),
+                                    s.get("sort","recent"),
+                                    s.get("page",0))
+        threading.Thread(target=_do_remove, daemon=True).start()
         return
 
     # ── Watchlist callbacks (read-side) ───────────────────────────────────────
@@ -6018,6 +6063,33 @@ def _wl_list() -> list[dict]:
     if code != 200 or not isinstance(body, list):
         return []
     return [_wl_normalize(r) for r in body]
+
+
+def _wl_add(tmdb_id: int, kind: str, status: str = "PLANNED") -> tuple[bool, dict | None]:
+    """Add content to watchlist. Returns (ok, watched_record)."""
+    if kind not in ("movie", "tv"):
+        return False, None
+    code, body = _watcharr_request("POST", "/api/watched",
+                                    {"contentId": tmdb_id,
+                                     "contentType": kind,
+                                     "status": status})
+    if code in (200, 201) and isinstance(body, dict):
+        return True, body
+    # 409 → already on watchlist
+    if code == 409:
+        return False, body
+    return False, body
+
+
+def _wl_update_status(watched_id: int, status: str) -> bool:
+    code, _ = _watcharr_request("PUT", f"/api/watched/{watched_id}",
+                                  {"status": status})
+    return code == 200
+
+
+def _wl_remove(watched_id: int) -> bool:
+    code, _ = _watcharr_request("DELETE", f"/api/watched/{watched_id}")
+    return code == 200
 
 
 def _render_watchlist(session: dict) -> tuple[str, str]:
