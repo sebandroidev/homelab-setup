@@ -5643,10 +5643,20 @@ def _gemini_text_pass(meta: dict) -> dict | None:
         "Western animation (Disney, Pixar, Cartoon Network) is NOT anime. "
         "Examples of anime: One Piece, Naruto, Demon Slayer, Spirited Away, "
         "Attack on Titan, Death Note, Cowboy Bebop, Your Name.\n\n"
+        "CRITICAL anti-guess rule:\n"
+        "- If the metadata title is a GENERIC description ('an anime about magic', "
+        "'best comedy of 2024', 'amazing scene', 'épisode incroyable', 'PT.1 ...') "
+        "and does NOT name a specific show/movie title, AND the description is "
+        "empty or also generic, you MUST return kind='unknown', title=null, "
+        "confidence ≤ 0.3. Do NOT guess a title just because it fits the genre.\n"
+        "- Confidence ≥ 0.7 ONLY when a specific identifying title is clearly "
+        "named in the metadata, hashtags, or uploader handle.\n"
+        "- Better to admit 'unknown' and let the video-frame analysis identify "
+        "it correctly than to confidently hallucinate the wrong title.\n\n"
         "Respond with JSON in this exact schema:\n"
         "{\n"
         '  "kind": "movie" | "tv" | "unknown",\n'
-        '  "title": "string (canonical title verbatim, no caption noise)",\n'
+        '  "title": "string or null (canonical title verbatim, no caption noise)",\n'
         '  "year": integer or null,\n'
         '  "is_anime": boolean,\n'
         '  "confidence": number from 0.0 to 1.0,\n'
@@ -6453,6 +6463,19 @@ def _handle_find_url(chat_id: int, url: str):
     kind, title = gemini.get("kind"), gemini.get("title")
     conf = float(gemini.get("confidence") or 0)
     year = gemini.get("year")
+
+    # Low-info-metadata heuristic: when the page has only a clickbait title and
+    # empty description/tags, Gemini's text-pass is guessing rather than reading.
+    # Force the video pass to ground the answer in actual frames+audio.
+    meta_title = (meta.get("title") or "").strip()
+    has_desc   = bool((meta.get("description") or "").strip())
+    has_tags   = bool(meta.get("tags") or meta.get("categories"))
+    word_count = len(meta_title.split())
+    low_info   = (not has_desc and not has_tags and word_count <= 8)
+    if low_info and conf < 0.95:
+        log.info("[find] low-info metadata (title=%r), forcing video escalation",
+                 meta_title[:60])
+        kind, title, conf = "unknown", None, 0.0   # force the escalation branch below
 
     if kind == "unknown" or not title or conf < FIND_CONFIDENCE_ESCALATE:
         # Stage 2: video escalation — feed the actual frames+audio to Gemini.
