@@ -875,6 +875,10 @@ def _run_watch_pipeline(dir_path, files):
                     fresh_dirs.add(os.path.dirname(_fp))
             if not fresh_dirs:
                 fresh_dirs.add(dir_path)  # fallback: original detected dir
+            # Strip any .trash-prefixed dirs — files queued for purge shouldn't
+            # consume lyrics-fetch quota nor get sidecars they'll never use.
+            fresh_dirs = {d for d in fresh_dirs
+                          if "/.trash/" not in d and not d.endswith("/.trash")}
             # Lyrics also run once at the end, scoped to fresh dirs only
             _wpipe_stage("lyrics")
             if not is_batch:

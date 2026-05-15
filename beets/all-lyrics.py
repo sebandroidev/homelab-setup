@@ -199,6 +199,11 @@ log(f"=== All-format lyrics fetch starting (dirs: {MUSIC_DIRS}) ===")
 for music_dir in MUSIC_DIRS:
     if not os.path.isdir(music_dir):
         continue
+    # Skip trash-prefixed roots — files queued for purge shouldn't consume
+    # lyrics-fetch quota nor get .lrc sidecars they'll never use.
+    if "/.trash/" in music_dir or music_dir.rstrip("/").endswith("/.trash"):
+        log(f"Skipping trash dir: {music_dir}")
+        continue
     log(f"Walking: {music_dir}")
     for root, dirs, files in os.walk(music_dir):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
