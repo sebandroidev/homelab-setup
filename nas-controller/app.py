@@ -5571,20 +5571,40 @@ def _handle_find_start(chat_id: int):
             "I'll identify the movie or TV show and look up its details.")
 
 
-def _ytdlp_metadata(url: str) -> dict | None:
-    """Run yt-dlp --dump-json and return a trimmed metadata dict."""
+def _ytdlp_classify_error(stderr: str) -> str:
+    """Map yt-dlp stderr to a coarse error_code: rate_limited | private |
+    unsupported | unavailable | generic."""
+    s = stderr.lower()
+    if "429" in s or "too many requests" in s or "rate-limit" in s or "rate limit" in s:
+        return "rate_limited"
+    if "private" in s or "login required" in s or "sign in" in s:
+        return "private"
+    if "unsupported url" in s or "no suitable extractor" in s:
+        return "unsupported"
+    if ("video unavailable" in s or "this video is unavailable" in s
+            or "removed" in s or "404" in s):
+        return "unavailable"
+    return "generic"
+
+
+def _ytdlp_metadata(url: str) -> tuple[dict | None, str | None]:
+    """Run yt-dlp --dump-json. Returns (meta, error_code).
+    error_code is None on success, else one of the codes from
+    _ytdlp_classify_error."""
     try:
         r = subprocess.run(
             ["python3", "-m", "yt_dlp", "--dump-json", "--no-warnings",
              "--no-playlist", "--socket-timeout", "10", url],
             capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            log.warning("[find] yt-dlp failed (%d): %s", r.returncode, r.stderr[:200])
-            return None
+            err = _ytdlp_classify_error(r.stderr or "")
+            log.warning("[find] yt-dlp failed (%d, %s): %s",
+                        r.returncode, err, r.stderr[:200])
+            return None, err
         data = json.loads(r.stdout.splitlines()[0])
     except Exception as e:
         log.warning("[find] yt-dlp exception: %s", e)
-        return None
+        return None, "generic"
     return {
         "title":       data.get("title") or "",
         "description": (data.get("description") or "")[:2000],
@@ -5594,7 +5614,7 @@ def _ytdlp_metadata(url: str) -> dict | None:
         "duration":    data.get("duration"),
         "webpage_url": data.get("webpage_url") or url,
         "extractor":   data.get("extractor_key") or "",
-    }
+    }, None
 
 
 def _gemini_text_pass(meta: dict) -> dict | None:
@@ -5666,8 +5686,9 @@ def _is_youtube_url(url: str) -> bool:
         return False
 
 
-def _ytdlp_download(url: str, dst: Path) -> Path | None:
-    """Download the smallest acceptable video stream, capped at GEMINI_VIDEO_MAX_MB."""
+def _ytdlp_download(url: str, dst: Path) -> tuple[Path | None, str | None]:
+    """Download the smallest acceptable video stream, capped at GEMINI_VIDEO_MAX_MB.
+    Returns (path, error_code). error_code is None on success."""
     try:
         r = subprocess.run(
             ["python3", "-m", "yt_dlp",
@@ -5679,15 +5700,15 @@ def _ytdlp_download(url: str, dst: Path) -> Path | None:
              url],
             capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
-            log.warning("[find] yt-dlp download failed (%d): %s",
-                        r.returncode, r.stderr[:200])
-            return None
+            err = _ytdlp_classify_error(r.stderr or "")
+            log.warning("[find] yt-dlp download failed (%d, %s): %s",
+                        r.returncode, err, r.stderr[:200])
+            return None, err
     except Exception as e:
         log.warning("[find] yt-dlp download exception: %s", e)
-        return None
-    # yt-dlp may have written the file under a different extension; resolve glob
+        return None, "generic"
     matches = list(dst.parent.glob(dst.stem + ".*"))
-    return matches[0] if matches else None
+    return (matches[0] if matches else None), None
 
 
 def _gemini_upload_file(path: Path, mime: str = "video/mp4") -> str | None:
@@ -6175,11 +6196,29 @@ def _handle_find_url(chat_id: int, url: str):
 
     # Stage 1: yt-dlp metadata
     tg_edit(chat_id, msg_id, f"⏳ Fetching metadata from `{_esc(host)}`…")
-    meta = _ytdlp_metadata(url)
+    meta, err = _ytdlp_metadata(url)
+    if err == "rate_limited":
+        tg_edit(chat_id, msg_id,
+                f"🚦 `{_esc(host)}` is rate-limiting me right now (HTTP 429).\n"
+                "Try again in ~10–15 minutes.")
+        return
+    if err == "private":
+        tg_edit(chat_id, msg_id,
+                f"🔒 `{_esc(host)}` says the post is private or requires sign-in.")
+        return
+    if err == "unsupported":
+        tg_edit(chat_id, msg_id,
+                f"🤷 `{_esc(host)}` isn't supported by yt-dlp. "
+                "Try a YouTube / TikTok / IG / X / Reddit URL.")
+        return
+    if err == "unavailable":
+        tg_edit(chat_id, msg_id,
+                f"❌ The post at `{_esc(host)}` is unavailable (removed or geo-blocked).")
+        return
     if not meta:
         tg_edit(chat_id, msg_id,
-                f"❌ Couldn't read metadata from `{_esc(host)}`.\n"
-                "Site may not be supported by yt-dlp, or the post is private/deleted.")
+                f"❌ Couldn't read metadata from `{_esc(host)}`. "
+                f"({err or 'unknown error'})")
         return
 
     # Stage 2: Gemini text pass
@@ -6206,10 +6245,15 @@ def _handle_find_url(chat_id: int, url: str):
             tmpdir = Path("/tmp/find_dl")
             tmpdir.mkdir(parents=True, exist_ok=True)
             dst = tmpdir / f"{uuid.uuid4().hex[:10]}.mp4"
-            path = _ytdlp_download(url, dst)
+            path, dl_err = _ytdlp_download(url, dst)
+            if dl_err == "rate_limited":
+                tg_edit(chat_id, msg_id,
+                        f"🚦 `{_esc(host)}` is rate-limiting downloads right now "
+                        "(HTTP 429). Try again in ~10–15 minutes.")
+                return
             if not path or not path.exists():
                 tg_edit(chat_id, msg_id,
-                        "❌ Couldn't download the clip (too large, unsupported site, or geo-blocked).")
+                        f"❌ Couldn't download the clip ({dl_err or 'too large / geo-blocked / unsupported'}).")
                 return
             try:
                 tg_edit(chat_id, msg_id, "📤 Uploading to Gemini Files API…")
