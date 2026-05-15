@@ -5617,6 +5617,66 @@ def _ytdlp_metadata(url: str) -> tuple[dict | None, str | None]:
     }, None
 
 
+def _gemini_error_msg(code: str) -> str:
+    return {
+        "overloaded":   "🥵 Gemini is overloaded right now (HTTP 503 from Google). "
+                        "It's a temporary capacity issue on their side — try again in a minute or two.",
+        "rate_limited": "🚦 Gemini free-tier quota hit (HTTP 429). "
+                        "Daily cap resets at midnight UTC; per-minute cap clears in <60s.",
+        "auth":         "🔑 Gemini auth error (HTTP 401/403). "
+                        "Check `GEMINI_API_KEY` in /opt/apps/nas-controller/.env.",
+        "timeout":      "⏰ Gemini call timed out. Try again.",
+        "generic":      "❌ Gemini call failed (see container logs).",
+    }.get(code, "❌ Gemini call failed.")
+
+
+def _gemini_post(body: dict, max_attempts: int = 2) -> tuple[dict | None, str]:
+    """POST to generateContent. Returns (parsed_response, error_code).
+    error_code on failure: "overloaded" | "rate_limited" | "auth" | "timeout" |
+    "generic". Auto-retries once on 503/overloaded after a short backoff."""
+    if not GEMINI_API_KEY:
+        return None, "auth"
+    url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
+    last_err = "generic"
+    for attempt in range(max_attempts):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json",
+                         "x-goog-api-key": GEMINI_API_KEY},
+                method="POST")
+            timeout = 120 if any("fileData" in p for p in body["contents"][0]["parts"]) else 30
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read()), ""
+        except urllib.error.HTTPError as e:
+            payload = b""
+            try: payload = e.read()
+            except Exception: pass
+            log.warning("[find] Gemini HTTP %d (attempt %d): %s",
+                        e.code, attempt + 1, payload[:200])
+            if e.code in (503,):
+                last_err = "overloaded"
+                if attempt + 1 < max_attempts:
+                    time.sleep(3 + attempt * 2)
+                    continue
+            elif e.code == 429:
+                last_err = "rate_limited"
+            elif e.code in (401, 403):
+                last_err = "auth"
+            else:
+                last_err = "generic"
+            return None, last_err
+        except Exception as e:
+            log.warning("[find] Gemini exception (attempt %d): %s", attempt + 1, e)
+            last_err = "timeout" if "timeout" in str(e).lower() else "generic"
+            if attempt + 1 < max_attempts:
+                time.sleep(2)
+                continue
+            return None, last_err
+    return None, last_err
+
+
 def _gemini_text_pass(meta: dict) -> dict | None:
     """Send video metadata to Gemini and ask it to identify the movie/TV show."""
     if not GEMINI_API_KEY:
@@ -5667,21 +5727,9 @@ def _gemini_text_pass(meta: dict) -> dict | None:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
-    try:
-        req = urllib.request.Request(
-            f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json",
-                     "x-goog-api-key": GEMINI_API_KEY},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            res = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        log.warning("[find] Gemini HTTP %d: %s", e.code, e.read()[:200])
-        return None
-    except Exception as e:
-        log.warning("[find] Gemini exception: %s", e)
-        return None
+    res, err = _gemini_post(body)
+    if not res:
+        return {"_error": err}
     try:
         txt = res["candidates"][0]["content"]["parts"][0]["text"]
         parsed = json.loads(txt)
@@ -5827,21 +5875,9 @@ def _gemini_video_pass(file_uri: str, mime: str = "video/mp4") -> dict | None:
         ]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
-    try:
-        req = urllib.request.Request(
-            f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent",
-            data=json.dumps(body).encode(),
-            method="POST",
-            headers={"Content-Type": "application/json",
-                     "x-goog-api-key": GEMINI_API_KEY})
-        with urllib.request.urlopen(req, timeout=120) as r:
-            res = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        log.warning("[find] Gemini video HTTP %d: %s", e.code, e.read()[:200])
-        return None
-    except Exception as e:
-        log.warning("[find] Gemini video exception: %s", e)
-        return None
+    res, err = _gemini_post(body)
+    if not res:
+        return {"_error": err}
     try:
         txt = res["candidates"][0]["content"]["parts"][0]["text"]
         parsed = json.loads(txt)
@@ -6457,7 +6493,10 @@ def _handle_find_url(chat_id: int, url: str):
     tg_edit(chat_id, msg_id, "🤖 Asking Gemini to identify the media…")
     gemini = _gemini_text_pass(meta)
     if not gemini:
-        tg_edit(chat_id, msg_id, "❌ Gemini call failed (rate limit? bad key?). Check logs.")
+        tg_edit(chat_id, msg_id, "❌ Gemini parse failed (unexpected response). Check logs.")
+        return
+    if gemini.get("_error"):
+        tg_edit(chat_id, msg_id, _gemini_error_msg(gemini["_error"]))
         return
 
     kind, title = gemini.get("kind"), gemini.get("title")
@@ -6512,8 +6551,10 @@ def _handle_find_url(chat_id: int, url: str):
                 try: path.unlink()
                 except Exception: pass
         if not video:
-            tg_edit(chat_id, msg_id,
-                    "❌ Video pass failed (rate limit? upload error?). Check logs.")
+            tg_edit(chat_id, msg_id, "❌ Gemini video parse failed. Check logs.")
+            return
+        if video.get("_error"):
+            tg_edit(chat_id, msg_id, _gemini_error_msg(video["_error"]))
             return
         gemini = video  # override the weak text-pass result
         kind, title, conf, year = (video.get("kind"), video.get("title"),
