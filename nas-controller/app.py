@@ -4282,11 +4282,50 @@ def _human_size(n: int) -> str:
 
 
 def _container_to_host_path(p: str) -> str:
-    """Translate beets /music/... container path back to host /media/nas-hdd/Musics/..."""
+    """Translate a beets path to its host absolute path.
+
+    beets stores paths as RELATIVE strings (e.g. `Adele/19/01 - Daydreamer.m4a`)
+    not absolute. We resolve by probing both watch-dir roots and returning the
+    first one whose file actually exists on disk. Absolute paths starting with
+    /music or /evymusics are translated normally for backward compatibility.
+    """
+    # Absolute container path with known prefix
     for host, container in BEETS_DIR_MAP.items():
         if p == container or p.startswith(container + "/"):
             return host + p[len(container):]
+    # Relative beets path → probe each watch root
+    if not p.startswith("/"):
+        for host in BEETS_DIR_MAP:
+            cand = os.path.join(host, p)
+            if os.path.exists(cand):
+                return cand
+        # No match on disk; default to first root so caller has something
+        first_root = next(iter(BEETS_DIR_MAP))
+        return os.path.join(first_root, p)
     return p
+
+
+def _beets_known_relpaths() -> set:
+    """Return the set of all beets-known paths as relative-form strings
+    (stripped of any /music or /evymusics prefix, lowercased once)."""
+    paths = set()
+    if not BEETS_DB.exists():
+        return paths
+    try:
+        con = _beets_open_ro()
+        for (p,) in con.execute("SELECT path FROM items"):
+            if isinstance(p, bytes):
+                p = p.decode("utf-8", errors="replace")
+            for host, container in BEETS_DIR_MAP.items():
+                if p.startswith(host + "/"):
+                    p = p[len(host) + 1:]; break
+                if p.startswith(container + "/"):
+                    p = p[len(container) + 1:]; break
+            paths.add(p.lstrip("/"))
+        con.close()
+    except Exception as e:
+        log.warning("[reconcile] beets DB read failed: %s", e)
+    return paths
 
 
 _PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
@@ -4769,32 +4808,25 @@ ORPHAN_RECONCILE_INTERVAL = 6 * 3600  # 6h
 
 
 def _list_orphans() -> dict[str, list[str]]:
-    """Compare /media/nas-hdd/Musics + Evyy Musics against beets DB.
-    Returns {host_dir: [host_file, ...]} of audio files unknown to beets."""
-    if not BEETS_DB.exists():
-        return {}
-    try:
-        con = _beets_open_ro()
-        known_paths = set()
-        for (p,) in con.execute("SELECT path FROM items"):
-            if isinstance(p, bytes):
-                p = p.decode("utf-8", errors="replace")
-            known_paths.add(_container_to_host_path(p))
-        con.close()
-    except Exception as e:
-        log.warning("[reconcile] beets DB read failed: %s", e)
+    """Compare watch dirs against beets DB. Returns {host_dir: [host_file, ...]}
+    of audio files unknown to beets. Matches by relative path (beets stores
+    paths relative to its `directory:` config, not absolute)."""
+    known = _beets_known_relpaths()
+    if known is None:
         return {}
     orphans: dict[str, list[str]] = {}
     for d in WATCH_DIRS:
         if not os.path.isdir(d):
             continue
+        d = d.rstrip("/")
         for root, dirs, files in os.walk(d):
             dirs[:] = [x for x in dirs if not x.startswith(".")]
             for fname in files:
                 if os.path.splitext(fname)[1].lower() not in AUDIO_EXTS:
                     continue
                 fp = os.path.join(root, fname)
-                if fp not in known_paths:
+                rel = os.path.relpath(fp, d)
+                if rel not in known:
                     orphans.setdefault(root, []).append(fp)
     return orphans
 
