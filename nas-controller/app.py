@@ -5908,7 +5908,8 @@ def _anilist_search(title: str, year: int | None) -> list[dict]:
                                      data=json.dumps(body).encode(),
                                      method="POST",
                                      headers={"Content-Type": "application/json",
-                                              "Accept": "application/json"})
+                                              "Accept": "application/json",
+                                              "User-Agent": "nas-controller/1.0 (homelab)"})
         with urllib.request.urlopen(req, timeout=15) as r:
             res = json.loads(r.read())
     except urllib.error.HTTPError as e:
@@ -5919,7 +5920,8 @@ def _anilist_search(title: str, year: int | None) -> list[dict]:
                 req = urllib.request.Request(ANILIST_URL,
                                              data=json.dumps(body).encode(),
                                              method="POST",
-                                             headers={"Content-Type": "application/json"})
+                                             headers={"Content-Type": "application/json",
+                                                      "User-Agent": "nas-controller/1.0 (homelab)"})
                 with urllib.request.urlopen(req, timeout=15) as r:
                     res = json.loads(r.read())
             except Exception as e2:
@@ -5936,7 +5938,8 @@ def _anilist_search(title: str, year: int | None) -> list[dict]:
             req = urllib.request.Request(ANILIST_URL,
                                          data=json.dumps(body).encode(),
                                          method="POST",
-                                         headers={"Content-Type": "application/json"})
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": "nas-controller/1.0 (homelab)"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 res = json.loads(r.read())
             media = (res.get("data") or {}).get("Page", {}).get("media") or []
