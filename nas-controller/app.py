@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NAS Controller — cron jobs, file watcher, Spotify import, Telegram bot."""
 
-import csv, hashlib, hmac, io, json, logging, os, re, subprocess, threading, time, urllib.parse, urllib.request, uuid, urllib.error
-from datetime import datetime
+import csv, hashlib, hmac, io, json, logging, os, re, shutil, sqlite3, subprocess, threading, time, urllib.parse, urllib.request, uuid, urllib.error
+from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, Response, request, redirect
 
@@ -16,6 +16,13 @@ HISTORY_FILE   = Path("/data/history.json")
 SEEN_FILE      = Path("/data/seen_files.json")
 SPOTIFY_FILE   = Path("/data/spotify.json")
 DOWNLOADS_FILE = Path("/data/downloads.json")
+TRASH_FILE     = Path("/data/trash.json")
+TRASH_ROOT     = Path("/media/nas-hdd/Musics/.trash")
+TRASH_RETENTION_DAYS = 7
+TRASH_PURGE_INTERVAL = 6 * 3600
+BEETS_DB       = Path("/beets-config/musiclibrary.db")  # mounted ro in compose
+DEL_SESSION_TTL = 300
+DEL_PAGE_SIZE   = 8
 
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://host.docker.internal:4533")
 NAV_USER      = os.getenv("NAVIDROME_USER", "sebastien")
@@ -104,6 +111,15 @@ TG_KEYBOARD = json.dumps({
     "persistent": True,
 })
 
+TG_LIBRARY_KB = json.dumps({
+    "keyboard": [
+        [{"text": "▶️ Run Sync"}, {"text": "🗑 Delete Tracks"}],
+        [{"text": "↩️ Back"}],
+    ],
+    "resize_keyboard": True,
+    "persistent": True,
+})
+
 _STATS_REFRESH_KB = json.dumps({
     "inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "stats:refresh"}]]
 })
@@ -148,6 +164,13 @@ _nav_index: set = set()
 _nav_isrc:  set = set()
 _downloads: dict = {}
 _dl_meta:   dict = {}   # dl_id -> {chat_id, msg_id, username, filenames, kind, source}
+
+# Track deletion state
+_del_pending: set = set()       # chat_ids awaiting search query
+_del_session: dict = {}         # chat_id -> session dict
+_del_lock     = threading.Lock()
+_trash:       dict = {"version": 1, "entries": {}}
+_trash_lock   = threading.Lock()
 _sp_lock = threading.Lock()
 _dl_lock = threading.Lock()
 
@@ -703,6 +726,7 @@ _NAS_ACTIONS = {
 def _nas_control_menu_kb():
     rows = [[{"text": a["label"], "callback_data": f"nas:{key}"}]
             for key, a in _NAS_ACTIONS.items()]
+    rows.append([{"text": "🧹 Empty trash", "callback_data": "nas:trash:empty"}])
     rows.append([{"text": "❌ Close", "callback_data": "nas:cancel"}])
     return _inline(rows)
 
@@ -3479,6 +3503,116 @@ def handle_callback(cq: dict):
         threading.Thread(target=_send_services_status, args=(chat_id, msg_id, mode), daemon=True).start()
         return
 
+    # ── Track deletion callbacks ──────────────────────────────────────────────
+    if data.startswith("del:tog:"):
+        idx = int(data.rsplit(":", 1)[1])
+        s = _del_session_get(chat_id)
+        if not s:
+            return
+        if idx in s["selected"]:
+            s["selected"].discard(idx)
+        else:
+            s["selected"].add(idx)
+        _del_session_set(chat_id, s)
+        msg_id = cq.get("message", {}).get("message_id")
+        text, kb = _render_del_results(s)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
+        return
+
+    if data.startswith("del:togalbum:"):
+        aid = int(data.rsplit(":", 1)[1])
+        s = _del_session_get(chat_id)
+        if not s:
+            return
+        if aid in s["selected_albums"]:
+            s["selected_albums"].discard(aid)
+        else:
+            s["selected_albums"].add(aid)
+        _del_session_set(chat_id, s)
+        msg_id = cq.get("message", {}).get("message_id")
+        text, kb = _render_del_results(s)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
+        return
+
+    if data in ("del:page:next", "del:page:prev"):
+        s = _del_session_get(chat_id)
+        if not s: return
+        delta = 1 if data.endswith("next") else -1
+        new_page = max(0, min(s["pages"] - 1, s["page"] + delta))
+        if new_page == s["page"]: return
+        # Re-query for new page
+        results, total = _beets_search(s["query"], page=new_page)
+        s["results"] = results
+        s["page"]    = new_page
+        s["total"]   = total
+        # Refresh albums map from new page
+        for r in results:
+            aid = r["album_id"]
+            if aid and aid not in s["albums"]:
+                s["albums"][aid] = {"name": r["album"], "year": r["year"], "artist": r["artist"]}
+        _del_session_set(chat_id, s)
+        msg_id = cq.get("message", {}).get("message_id")
+        text, kb = _render_del_results(s)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
+        return
+
+    if data == "del:confirm":
+        s = _del_session_get(chat_id)
+        if not s:
+            return
+        items = _resolve_selected(s)
+        msg_id = cq.get("message", {}).get("message_id")
+        if not items:
+            _tg_call("answerCallbackQuery", callback_query_id=cq_id,
+                     text="Nothing selected", show_alert=True)
+            return
+        text, kb = _render_del_preview(s, items)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
+        return
+
+    if data == "del:back":
+        s = _del_session_get(chat_id)
+        if not s: return
+        msg_id = cq.get("message", {}).get("message_id")
+        text, kb = _render_del_results(s)
+        try: tg_edit(chat_id, msg_id, text, reply_markup=kb)
+        except Exception: pass
+        return
+
+    if data == "del:cancel":
+        msg_id = cq.get("message", {}).get("message_id")
+        with _del_lock:
+            _del_session.pop(chat_id, None)
+        if msg_id:
+            _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        tg_send(chat_id, "Cancelled.", reply_markup=TG_LIBRARY_KB)
+        return
+
+    if data == "del:execute":
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_run_trash, args=(chat_id, msg_id), daemon=True).start()
+        return
+
+    if data.startswith("trash:undo:"):
+        trash_id = data.split(":", 2)[2]
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_run_undo, args=(chat_id, msg_id, trash_id), daemon=True).start()
+        return
+
+    if data == "nas:trash:empty":
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_empty_trash_preview, args=(chat_id, msg_id), daemon=True).start()
+        return
+
+    if data == "nas:trash:empty:confirm":
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_empty_trash_execute, args=(chat_id, msg_id), daemon=True).start()
+        return
+
     if data == "maint:confirm":
         global _maint_running
         msg_id = cq.get("message", {}).get("message_id")
@@ -3835,12 +3969,32 @@ def handle_tg(chat_id, text):
         threading.Thread(target=_send_nas_stats, args=(chat_id,), daemon=True).start()
         return
 
-    if "library" in t or "🗂" in text:
+    # Library submenu buttons (must come BEFORE the generic "library" matcher)
+    if text in ("▶️ Run Sync",) or t == "run sync":
         kb = _inline([
             [{"text": "▶️ Run now", "callback_data": "maint:confirm"},
-             {"text": "❌ Cancel", "callback_data": "maint:cancel"}],
+             {"text": "❌ Cancel",   "callback_data": "maint:cancel"}],
         ])
         tg_send(chat_id, "🗂 *Library Sync*\nRuns: art fetch → organize → full lyrics scan → Navidrome rescan.\nThis takes ~15 min.", reply_markup=kb)
+        return
+
+    if text in ("🗑 Delete Tracks",) or ("delete" in t and "track" in t):
+        _handle_delete_start(chat_id)
+        return
+
+    if text in ("↩️ Back",) or t == "back":
+        tg_send(chat_id, "Main menu.", reply_markup=TG_KEYBOARD)
+        return
+
+    if "library" in t or "🗂" in text:
+        tg_send(chat_id, "🗂 *Library*\nChoose an action:", reply_markup=TG_LIBRARY_KB)
+        return
+
+    # If chat is awaiting a delete-search query, treat next text as the query
+    if chat_id in _del_pending:
+        _del_pending.discard(chat_id)
+        threading.Thread(target=_handle_delete_query,
+                         args=(chat_id, text), daemon=True).start()
         return
 
     if "nas control" in t or "control" in t or "🔌" in text:
@@ -4075,6 +4229,559 @@ def _dns_watchdog():
                         capture_output=True, timeout=30)
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
+# ── Track deletion (soft trash) ───────────────────────────────────────────────
+def _load_trash():
+    global _trash
+    if not TRASH_FILE.exists():
+        return
+    try:
+        data = json.loads(TRASH_FILE.read_text())
+        if "entries" not in data:
+            data["entries"] = {}
+        _trash = data
+        log.info("[trash] loaded %d journal entries", len(_trash["entries"]))
+    except Exception as e:
+        log.warning("[trash] load failed: %s", e)
+
+
+def _save_trash():
+    try:
+        TRASH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TRASH_FILE.with_suffix(".tmp")
+        with _trash_lock:
+            payload = json.dumps(_trash, indent=2, default=str)
+        tmp.write_text(payload)
+        tmp.replace(TRASH_FILE)
+    except Exception as e:
+        log.warning("[trash] save failed: %s", e)
+
+
+def _human_size(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if f < 1024.0:
+            return f"{f:.0f}{unit}" if unit == "B" else f"{f:.1f}{unit}"
+        f /= 1024.0
+    return f"{f:.1f}TB"
+
+
+def _container_to_host_path(p: str) -> str:
+    """Translate beets /music/... container path back to host /media/nas-hdd/Musics/..."""
+    for host, container in BEETS_DIR_MAP.items():
+        if p == container or p.startswith(container + "/"):
+            return host + p[len(container):]
+    return p
+
+
+def _split_artist_title(query: str) -> tuple[str, str]:
+    parts = re.split(r"\s*[—–\-]\s*", query.strip(), maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return query.strip(), query.strip()
+
+
+def _beets_search(query: str, page: int = 0) -> tuple[list, int]:
+    if not BEETS_DB.exists():
+        log.warning("[del] beets DB not mounted at %s", BEETS_DB)
+        return [], 0
+    artist_q, title_q = _split_artist_title(query)
+    a_like = f"%{artist_q.lower()}%"
+    t_like = f"%{title_q.lower()}%"
+    try:
+        con = sqlite3.connect(f"file:{BEETS_DB}?mode=ro", uri=True)
+        total = con.execute(
+            "SELECT COUNT(*) FROM items "
+            "WHERE LOWER(artist) LIKE ? OR LOWER(title) LIKE ? OR LOWER(album) LIKE ?",
+            (a_like, t_like, t_like)).fetchone()[0]
+        rows = con.execute(
+            "SELECT id, album_id, artist, title, album, year, path "
+            "FROM items "
+            "WHERE LOWER(artist) LIKE ? OR LOWER(title) LIKE ? OR LOWER(album) LIKE ? "
+            "ORDER BY artist, album, track "
+            "LIMIT ? OFFSET ?",
+            (a_like, t_like, t_like, DEL_PAGE_SIZE, page * DEL_PAGE_SIZE)).fetchall()
+        con.close()
+    except Exception as e:
+        log.warning("[del] beets query failed: %s", e)
+        return [], 0
+    return [_row_to_track(r) for r in rows], total
+
+
+def _beets_album_tracks(album_id: int) -> list:
+    if not BEETS_DB.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{BEETS_DB}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT id, album_id, artist, title, album, year, path "
+            "FROM items WHERE album_id = ? ORDER BY track",
+            (album_id,)).fetchall()
+        con.close()
+    except Exception as e:
+        log.warning("[del] album tracks query failed: %s", e)
+        return []
+    return [_row_to_track(r) for r in rows]
+
+
+def _row_to_track(r) -> dict:
+    bid, aid, artist, title, album, year, bpath = r
+    if isinstance(bpath, bytes):
+        bpath = bpath.decode("utf-8", errors="replace")
+    host_path = _container_to_host_path(bpath)
+    size = 0
+    try:
+        size = os.path.getsize(host_path)
+    except OSError:
+        pass
+    return {
+        "id":             bid,
+        "album_id":       aid,
+        "artist":         artist or "Unknown",
+        "title":          title or "Unknown",
+        "album":          album or "",
+        "year":           year or 0,
+        "container_path": bpath,
+        "host_path":      host_path,
+        "size":           size,
+    }
+
+
+def _del_session_get(chat_id):
+    with _del_lock:
+        s = _del_session.get(chat_id)
+        if not s:
+            return None
+        if time.time() > s.get("expires_at", 0):
+            _del_session.pop(chat_id, None)
+            return None
+        return s
+
+
+def _del_session_set(chat_id, session):
+    session["expires_at"] = time.time() + DEL_SESSION_TTL
+    with _del_lock:
+        _del_session[chat_id] = session
+
+
+def _handle_delete_start(chat_id):
+    _del_pending.add(chat_id)
+    tg_send(chat_id,
+            "🗑 *Delete Tracks*\n\nSend `artist — title` (or part of it) to search your library.\n"
+            "_Examples: `kaaris or noir` · `daft punk` · `discovery`_")
+
+
+def _handle_delete_query(chat_id, query):
+    if not query.strip():
+        tg_send(chat_id, "Empty query. Tap 🗑 Delete Tracks to try again.",
+                reply_markup=TG_LIBRARY_KB)
+        return
+    results, total = _beets_search(query, page=0)
+    if not results:
+        tg_send(chat_id, f"❌ No matches for `{_esc(query)}` in your library.",
+                reply_markup=TG_LIBRARY_KB)
+        return
+    pages = max(1, (total + DEL_PAGE_SIZE - 1) // DEL_PAGE_SIZE)
+    albums = {}
+    for r in results:
+        aid = r["album_id"]
+        if aid and aid not in albums:
+            albums[aid] = {"name": r["album"], "year": r["year"], "artist": r["artist"]}
+    session = {
+        "chat_id":         chat_id,
+        "query":           query,
+        "results":         results,
+        "albums":          albums,
+        "page":            0,
+        "pages":           pages,
+        "total":           total,
+        "selected":        set(),
+        "selected_albums": set(),
+    }
+    text, kb = _render_del_results(session)
+    res = tg_send(chat_id, text, reply_markup=kb)
+    session["msg_id"] = (res or {}).get("result", {}).get("message_id")
+    _del_session_set(chat_id, session)
+
+
+def _selected_count(session) -> int:
+    """Total deletions: explicit track picks + album expansions (deduped)."""
+    ids = set()
+    for idx in session["selected"]:
+        if idx < len(session["results"]):
+            ids.add(session["results"][idx]["id"])
+    for aid in session["selected_albums"]:
+        for t in _beets_album_tracks(aid):
+            ids.add(t["id"])
+    return len(ids)
+
+
+def _render_del_results(session):
+    text_lines = [f"🗑 *Delete Tracks* — `{_esc(session['query'])}`",
+                  f"Found *{session['total']}* match(es) · page {session['page']+1}/{session['pages']}",
+                  ""]
+    sel_n = _selected_count(session)
+    rows = []
+    for i, r in enumerate(session["results"]):
+        is_sel = i in session["selected"] or r["album_id"] in session["selected_albums"]
+        icon = "☑️" if is_sel else "☐"
+        label = f"{icon} {r['artist'][:18]} — {r['title'][:28]}"
+        rows.append([{"text": label[:60], "callback_data": f"del:tog:{i}"}])
+    if session["albums"]:
+        for aid, a in list(session["albums"].items())[:3]:
+            is_sel = aid in session["selected_albums"]
+            icon = "💿✅" if is_sel else "💿"
+            on_page = sum(1 for r in session["results"] if r["album_id"] == aid)
+            rows.append([{"text": f"{icon} Whole album: {a['name'][:28]} ({on_page} on page)",
+                          "callback_data": f"del:togalbum:{aid}"}])
+    nav = []
+    if session["page"] > 0:
+        nav.append({"text": "◀️ Prev", "callback_data": "del:page:prev"})
+    if session["page"] + 1 < session["pages"]:
+        nav.append({"text": "Next ▶️", "callback_data": "del:page:next"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": f"✅ Confirm ({sel_n})", "callback_data": "del:confirm"},
+                 {"text": "❌ Cancel",            "callback_data": "del:cancel"}])
+    return "\n".join(text_lines), _inline(rows)
+
+
+def _resolve_selected(session) -> list:
+    out, seen = [], set()
+    for idx in session["selected"]:
+        if idx < len(session["results"]):
+            r = session["results"][idx]
+            if r["id"] not in seen:
+                seen.add(r["id"]); out.append(r)
+    for aid in session["selected_albums"]:
+        for t in _beets_album_tracks(aid):
+            if t["id"] not in seen:
+                seen.add(t["id"]); out.append(t)
+    return out
+
+
+def _render_del_preview(session, items):
+    total_size = sum(it["size"] for it in items)
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"🗑 *Trash {len(items)} track(s)?*", ""]
+    for it in items[:12]:
+        lines.append(f"  • {_esc(it['artist'])} — {_esc(it['title'])}")
+    if len(items) > 12:
+        lines.append(f"  …and {len(items) - 12} more")
+    lines.append("")
+    lines.append(f"Total size: *{_human_size(total_size)}*")
+    lines.append(f"Moving to: `/media/nas-hdd/Musics/.trash/{today}/`")
+    lines.append(f"Recoverable for *{TRASH_RETENTION_DAYS} days*")
+    rows = [
+        [{"text": "✅ Yes, trash them", "callback_data": "del:execute"}],
+        [{"text": "◀️ Back to results", "callback_data": "del:back"}],
+        [{"text": "❌ Cancel",           "callback_data": "del:cancel"}],
+    ]
+    return "\n".join(lines), _inline(rows)
+
+
+def _trash_move_one(item, trash_root_day):
+    src = Path(item["host_path"])
+    if not src.exists():
+        raise FileNotFoundError(str(src))
+    src_str = str(src)
+    if src_str.startswith("/media/nas-hdd/Musics"):
+        base, root = "Musics", "/media/nas-hdd/Musics"
+    elif src_str.startswith("/media/nas-hdd/Evyy Musics"):
+        base, root = "Evyy Musics", "/media/nas-hdd/Evyy Musics"
+    else:
+        raise ValueError(f"path outside watched dirs: {src_str}")
+    rel = src.relative_to(root)
+    dst = trash_root_day / base / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    entry = {
+        "src":        str(src),
+        "dst":        str(dst),
+        "beets_id":   item["id"],
+        "album_id":   item["album_id"],
+        "size_bytes": item["size"],
+        "artist":     item["artist"],
+        "title":      item["title"],
+        "album":      item["album"],
+    }
+    lrc = src.with_suffix(".lrc")
+    if lrc.exists():
+        dst_lrc = dst.with_suffix(".lrc")
+        try:
+            shutil.move(str(lrc), str(dst_lrc))
+            entry["lrc_src"] = str(lrc)
+            entry["lrc_dst"] = str(dst_lrc)
+        except Exception as e:
+            log.warning("[trash] lrc move failed for %s: %s", lrc, e)
+    return entry
+
+
+def _trash_move_empty_dirs(items, trash_root_day):
+    moved = []
+    seen = {Path(it["host_path"]).parent for it in items}
+    for d in seen:
+        try:
+            if not d.exists() or any(d.iterdir()):
+                continue
+            d_str = str(d)
+            if d_str.startswith("/media/nas-hdd/Musics"):
+                base, root = "Musics", "/media/nas-hdd/Musics"
+            elif d_str.startswith("/media/nas-hdd/Evyy Musics"):
+                base, root = "Evyy Musics", "/media/nas-hdd/Evyy Musics"
+            else:
+                continue
+            rel = d.relative_to(root)
+            dst = trash_root_day / base / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(d), str(dst))
+            moved.append({"src": str(d), "dst": str(dst)})
+        except Exception as e:
+            log.warning("[trash] empty-dir move failed for %s: %s", d, e)
+    return moved
+
+
+def _beets_remove_ids(ids: list[int]):
+    if not ids:
+        return
+    # beet supports OR within a query via comma-separated terms
+    q_parts = [f"id:{i}" for i in ids]
+    q = " , ".join(q_parts)
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "beets", "beet", "remove", "-q"] + q.split(" "),
+            capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            log.warning("[del] beet remove rc=%s stderr=%s", r.returncode, r.stderr.strip())
+    except Exception as e:
+        log.warning("[del] beet remove exec failed: %s", e)
+
+
+def _run_trash(chat_id, msg_id):
+    session = _del_session_get(chat_id)
+    if not session:
+        tg_edit(chat_id, msg_id, "⏰ Session expired — tap 🗑 Delete Tracks again.")
+        return
+    items = _resolve_selected(session)
+    if not items:
+        tg_edit(chat_id, msg_id, "❌ Nothing selected.")
+        return
+    if not _pipeline_lock.acquire(blocking=False):
+        tg_edit(chat_id, msg_id, "⚠️ A pipeline is currently running — try again in a few minutes.")
+        return
+    try:
+        tg_edit(chat_id, msg_id, "⏳ Moving files to trash…")
+        trash_id   = uuid.uuid4().hex[:8]
+        trash_date = datetime.now().strftime("%Y-%m-%d")
+        trash_root_day = TRASH_ROOT / trash_date
+        moved, failures = [], []
+        for it in items:
+            try:
+                moved.append(_trash_move_one(it, trash_root_day))
+            except Exception as e:
+                log.warning("[trash] move failed for %s: %s", it.get("host_path"), e)
+                failures.append({"path": it.get("host_path"), "error": str(e)})
+        if not moved:
+            err = failures[0]["error"] if failures else "unknown"
+            tg_edit(chat_id, msg_id, f"❌ All moves failed.\n`{_esc(err)}`")
+            return
+        moved_dirs = _trash_move_empty_dirs(items, trash_root_day)
+        _beets_remove_ids([it["id"] for it in items])
+        now = datetime.now()
+        entry = {
+            "trash_id":    trash_id,
+            "trashed_at":  now.isoformat(timespec="seconds"),
+            "purge_at":    (now + timedelta(days=TRASH_RETENTION_DAYS)).isoformat(timespec="seconds"),
+            "chat_id":     chat_id,
+            "total_bytes": sum(m["size_bytes"] for m in moved),
+            "items":       moved,
+            "moved_dirs":  moved_dirs,
+        }
+        with _trash_lock:
+            _trash["entries"][trash_id] = entry
+        _save_trash()
+        try:
+            _nav_request("startScan")
+        except Exception as e:
+            log.warning("[trash] navidrome rescan failed: %s", e)
+        kb = _inline([[{"text": f"↩️ Undo ({TRASH_RETENTION_DAYS}d 0h)",
+                       "callback_data": f"trash:undo:{trash_id}"}]])
+        tail = f"\n⚠️ {len(failures)} failure(s)" if failures else ""
+        tg_edit(chat_id, msg_id,
+                f"✅ Trashed *{len(moved)}* track(s) — {_human_size(entry['total_bytes'])} freed.{tail}\n"
+                f"Navidrome rescan queued.",
+                reply_markup=kb)
+        with _del_lock:
+            _del_session.pop(chat_id, None)
+    finally:
+        _pipeline_lock.release()
+
+
+def _run_undo(chat_id, msg_id, trash_id):
+    with _trash_lock:
+        entry = _trash["entries"].get(trash_id)
+    if not entry:
+        tg_edit(chat_id, msg_id, "⏰ Trash entry not found or already purged.")
+        return
+    if not _pipeline_lock.acquire(blocking=False):
+        tg_edit(chat_id, msg_id, "⚠️ Pipeline busy — try again in a few minutes.")
+        return
+    try:
+        tg_edit(chat_id, msg_id, "⏳ Restoring files…")
+        # Restore moved dirs first (so file parents exist again)
+        for d in entry.get("moved_dirs", []):
+            try:
+                src = Path(d["dst"]); dst = Path(d["src"])
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+            except Exception as e:
+                log.warning("[undo] dir restore failed %s: %s", d.get("src"), e)
+        restored = 0
+        restored_dirs = set()
+        failures = []
+        for it in entry["items"]:
+            try:
+                src = Path(it["dst"]); dst = Path(it["src"])
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    restored += 1
+                    restored_dirs.add(str(dst.parent))
+                lrc_src = it.get("lrc_dst"); lrc_dst = it.get("lrc_src")
+                if lrc_src and Path(lrc_src).exists() and lrc_dst:
+                    shutil.move(lrc_src, lrc_dst)
+            except Exception as e:
+                failures.append(f"{it.get('src','?')}: {e}")
+        # Re-register restored files with beets
+        for d in restored_dirs:
+            try:
+                subprocess.run(
+                    ["docker", "exec", "beets", "beet", "import", "-q",
+                     "--noautotag", "--noresume",
+                     d.replace("/media/nas-hdd/Musics", "/music")
+                      .replace("/media/nas-hdd/Evyy Musics", "/evymusics")],
+                    capture_output=True, text=True, timeout=300)
+            except Exception as e:
+                log.warning("[undo] beet import failed for %s: %s", d, e)
+        try:
+            _nav_request("startScan")
+        except Exception:
+            pass
+        with _trash_lock:
+            _trash["entries"].pop(trash_id, None)
+        _save_trash()
+        tail = ""
+        if failures:
+            tail = f"\n⚠️ {len(failures)} file(s) couldn't restore:\n" + \
+                   "\n".join(f"  • {_esc(f)}" for f in failures[:5])
+        tg_edit(chat_id, msg_id, f"↩️ Restored *{restored}* track(s).{tail}")
+    finally:
+        _pipeline_lock.release()
+
+
+def _trash_purge_loop():
+    while True:
+        time.sleep(TRASH_PURGE_INTERVAL)
+        try:
+            _purge_expired_trash()
+        except Exception as e:
+            log.warning("[trash] purge loop error: %s", e)
+
+
+def _purge_expired_trash():
+    now = datetime.now()
+    to_purge = []
+    with _trash_lock:
+        for tid, e in list(_trash["entries"].items()):
+            try:
+                if datetime.fromisoformat(e["purge_at"]) <= now:
+                    to_purge.append(tid)
+            except Exception:
+                continue
+    if not to_purge:
+        return
+    log.info("[trash] purging %d expired entries", len(to_purge))
+    for tid in to_purge:
+        with _trash_lock:
+            e = _trash["entries"].pop(tid, None)
+        if not e:
+            continue
+        for it in e.get("items", []):
+            for p in (it.get("dst"), it.get("lrc_dst")):
+                if not p:
+                    continue
+                try:
+                    pp = Path(p)
+                    if pp.exists():
+                        pp.unlink()
+                except Exception as exc:
+                    log.warning("[trash] purge unlink %s: %s", p, exc)
+        for d in e.get("moved_dirs", []):
+            try:
+                p = Path(d["dst"])
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+    _save_trash()
+
+
+def _empty_trash_preview(chat_id, msg_id):
+    total_size = 0
+    count = 0
+    with _trash_lock:
+        for e in _trash["entries"].values():
+            total_size += e.get("total_bytes", 0)
+            count += len(e.get("items", []))
+    if count == 0:
+        tg_edit(chat_id, msg_id, "🧹 Trash is already empty.")
+        return
+    kb = _inline([
+        [{"text": "💥 Yes, empty all", "callback_data": "nas:trash:empty:confirm"}],
+        [{"text": "❌ Cancel",          "callback_data": "nas:cancel"}],
+    ])
+    tg_edit(chat_id, msg_id,
+            f"🧹 *Empty Trash*\n\n{count} file(s) · {_human_size(total_size)}\n\n"
+            f"⚠️ Permanently deletes everything — *cannot be undone*.",
+            reply_markup=kb)
+
+
+def _empty_trash_execute(chat_id, msg_id):
+    purged = 0
+    with _trash_lock:
+        ids = list(_trash["entries"].keys())
+    for tid in ids:
+        with _trash_lock:
+            e = _trash["entries"].pop(tid, None)
+        if not e:
+            continue
+        purged += 1
+        for it in e.get("items", []):
+            for p in (it.get("dst"), it.get("lrc_dst")):
+                if not p:
+                    continue
+                try:
+                    pp = Path(p)
+                    if pp.exists():
+                        pp.unlink()
+                except Exception:
+                    pass
+        for d in e.get("moved_dirs", []):
+            try:
+                p = Path(d["dst"])
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+    _save_trash()
+    try:
+        if TRASH_ROOT.exists():
+            shutil.rmtree(TRASH_ROOT, ignore_errors=True)
+    except Exception:
+        pass
+    tg_edit(chat_id, msg_id, f"🧹 *Trash emptied.* Purged {purged} entry/entries.")
+
+
 # ── Download persistence + resume ─────────────────────────────────────────────
 _TERMINAL_DL_STATES = {"done", "error", "cancelled"}
 
@@ -4227,4 +4934,6 @@ if __name__ == "__main__":
     threading.Thread(target=_startup_notification,   daemon=True).start()
     threading.Thread(target=_downloads_flush_loop,   daemon=True).start()
     _load_and_resume_downloads()
+    _load_trash()
+    threading.Thread(target=_trash_purge_loop,       daemon=True).start()
     app.run(host="0.0.0.0", port=8888, debug=False)

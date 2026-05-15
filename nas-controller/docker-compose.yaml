@@ -31,6 +31,7 @@ services:
       - /opt/apps/homelab-setup:/DATA/homelab-setup
       - /usr/bin/docker:/usr/bin/docker:ro
       - /opt/apps/navidrome:/DATA/AppData/navidrome
+      - /media/nas-hdd/nas-migration-backup-20260506/AppData/beets/config:/beets-config:ro
       - ./data:/data
     dns:
       - 8.8.8.8
