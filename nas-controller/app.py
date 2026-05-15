@@ -91,6 +91,7 @@ EXPOSED_SERVICES = [
     {"name": "Grafana",     "icon": "📊", "online": "https://grafana.bastienlab.com",    "lan_port": 3030,  "check": "http://host.docker.internal:3030"},
     {"name": "Files",       "icon": "📁", "online": "https://files.bastienlab.com",      "lan_port": 10081, "check": "http://host.docker.internal:10081"},
     {"name": "Dokploy",     "icon": "🐳", "online": "https://dokploy.bastienlab.com",    "lan_port": 3000,  "check": "http://host.docker.internal:3000"},
+    {"name": "Watchlist",   "icon": "📺", "online": "https://watchlist.bastienlab.com",  "lan_port": 3201,  "check": "http://host.docker.internal:3201"},
 ]
 
 
