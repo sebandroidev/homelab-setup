@@ -3730,6 +3730,38 @@ def handle_callback(cq: dict):
         threading.Thread(target=_do_status, daemon=True).start()
         return
 
+    if data.startswith("wl:episodes:"):
+        wid = int(data.rsplit(":", 1)[1])
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_send_episode_grid,
+                         args=(chat_id, msg_id, wid, None), daemon=True).start()
+        return
+
+    if data.startswith("wl:season:"):
+        parts = data.split(":")
+        wid = int(parts[2]); season = int(parts[3])
+        msg_id = cq.get("message", {}).get("message_id")
+        threading.Thread(target=_send_episode_grid,
+                         args=(chat_id, msg_id, wid, season), daemon=True).start()
+        return
+
+    if data.startswith("wl:ep:"):
+        parts = data.split(":")
+        wid = int(parts[2]); season = int(parts[3]); ep = int(parts[4])
+        msg_id = cq.get("message", {}).get("message_id")
+        def _do_toggle():
+            item = _wl_get_item(wid)
+            if not item:
+                tg_send(chat_id, "❌ Item not found."); return
+            currently_watched = (season, ep) in item["watched_eps"]
+            new_status = "" if currently_watched else "FINISHED"
+            if _wl_set_episode(wid, season, ep, new_status):
+                _send_episode_grid(chat_id, msg_id, wid, season)
+            else:
+                tg_send(chat_id, "❌ Episode toggle failed.")
+        threading.Thread(target=_do_toggle, daemon=True).start()
+        return
+
     if data.startswith("wl:remove:"):
         wid = int(data.rsplit(":", 1)[1])
         msg_id = cq.get("message", {}).get("message_id")
@@ -6040,6 +6072,11 @@ def _wl_normalize(raw: dict) -> dict:
     year = int(date[:4]) if date[:4].isdigit() else None
     poster = c.get("poster_path")
     kind = c.get("type") or "movie"
+    # Watched-episodes set: {(season, episode), ...}
+    watched_eps = set()
+    for we in (raw.get("watchedEpisodes") or []):
+        if we.get("status") == "FINISHED":
+            watched_eps.add((we.get("seasonNumber"), we.get("episodeNumber")))
     return {
         "watched_id":       raw.get("id"),
         "tmdb_id":          c.get("tmdbId"),
@@ -6055,6 +6092,8 @@ def _wl_normalize(raw: dict) -> dict:
         "created_at":       raw.get("createdAt") or "",
         "seasons":          c.get("numberOfSeasons") or 0,
         "episodes":         c.get("numberOfEpisodes") or 0,
+        "watched_eps":      watched_eps,
+        "last_viewed_season": raw.get("lastViewedSeason") or 1,
     }
 
 
@@ -6090,6 +6129,119 @@ def _wl_update_status(watched_id: int, status: str) -> bool:
 def _wl_remove(watched_id: int) -> bool:
     code, _ = _watcharr_request("DELETE", f"/api/watched/{watched_id}")
     return code == 200
+
+
+def _wl_set_episode(watched_id: int, season: int, episode: int,
+                     status: str = "FINISHED") -> bool:
+    """POST /api/watched/episode marks (or unmarks if status='') an episode."""
+    body = {"watchedId": watched_id, "seasonNumber": season,
+            "episodeNumber": episode, "status": status}
+    code, _ = _watcharr_request("POST", "/api/watched/episode", body)
+    return code == 200
+
+
+def _wl_get_item(watched_id: int) -> dict | None:
+    """Fetch a single watched record (incl. fresh watchedEpisodes) via the list."""
+    for it in _wl_list():
+        if it["watched_id"] == watched_id:
+            return it
+    return None
+
+
+def _tmdb_episodes(tv_id: int, season: int) -> list[dict]:
+    """List episodes for a season from TMDB: [{episode_number, name, air_date, vote_average}, ...]"""
+    res = _tmdb_request(f"/tv/{tv_id}/season/{season}")
+    if not res or "episodes" not in res:
+        return []
+    return [
+        {
+            "episode_number": e.get("episode_number"),
+            "name":           e.get("name") or "",
+            "air_date":       e.get("air_date") or "",
+            "rating":         round(float(e.get("vote_average") or 0), 1),
+        }
+        for e in res["episodes"]
+    ]
+
+
+def _render_episode_grid(item: dict, season: int, eps: list[dict]) -> tuple[str, str]:
+    title = f"📋 *{_esc(item['title'])}* — Season {season}"
+    total = len(eps)
+    watched_in_season = sum(1 for e in eps if (season, e["episode_number"]) in item["watched_eps"])
+    head = f"{title}\n_{watched_in_season}/{total} watched_"
+    lines = [head, ""]
+    for e in eps[:20]:
+        en = e["episode_number"]
+        mark = "✅" if (season, en) in item["watched_eps"] else "⬜"
+        air = e["air_date"][:10] if e["air_date"] else ""
+        lines.append(f"{mark} E{en:02d}  {_esc(e['name'][:40])}{'  · ' + air if air else ''}")
+    if len(eps) > 20:
+        lines.append(f"\n_…and {len(eps)-20} more (showing first 20)._")
+
+    rows = []
+    # Episode toggle row(s) — 4 per row, up to 20 episodes
+    eps_slice = eps[:20]
+    for i in range(0, len(eps_slice), 4):
+        row = []
+        for e in eps_slice[i:i+4]:
+            en = e["episode_number"]
+            mark = "✅" if (season, en) in item["watched_eps"] else "⬜"
+            row.append({"text": f"{mark}E{en}",
+                        "callback_data": f"wl:ep:{item['watched_id']}:{season}:{en}"})
+        rows.append(row)
+
+    # Season picker (≤10 seasons inline; otherwise omit)
+    if item["seasons"] and item["seasons"] <= 10:
+        season_row = []
+        for s in range(1, item["seasons"] + 1):
+            mark = "•" if s == season else " "
+            season_row.append({"text": f"{mark}S{s}",
+                               "callback_data": f"wl:season:{item['watched_id']}:{s}"})
+        # Split if more than 5 per row
+        rows.append(season_row[:5])
+        if len(season_row) > 5:
+            rows.append(season_row[5:])
+    else:
+        # Just give Prev/Next season nav
+        nav = []
+        if season > 1:
+            nav.append({"text": f"◀️ S{season-1}",
+                        "callback_data": f"wl:season:{item['watched_id']}:{season-1}"})
+        if season < (item["seasons"] or 99):
+            nav.append({"text": f"S{season+1} ▶️",
+                        "callback_data": f"wl:season:{item['watched_id']}:{season+1}"})
+        if nav: rows.append(nav)
+
+    rows.append([{"text": "◀️ Back to show",
+                  "callback_data": f"wl:item:{item['watched_id']}"}])
+    return "\n".join(lines), _inline(rows)
+
+
+def _send_episode_grid(chat_id: int, msg_id: int, watched_id: int,
+                        season: int | None = None):
+    item = _wl_get_item(watched_id)
+    if not item or item["kind"] != "tv":
+        tg_edit(chat_id, msg_id, "❌ Not a TV show or not found.")
+        return
+    if season is None:
+        season = item.get("last_viewed_season") or 1
+    eps = _tmdb_episodes(item["tmdb_id"], season)
+    if not eps:
+        tg_edit(chat_id, msg_id, f"❌ No episode data for season {season}.")
+        return
+    text, kb = _render_episode_grid(item, season, eps)
+    # If previous message was a photo card, deleteMessage then send a fresh text
+    try:
+        tg_edit(chat_id, msg_id, text, reply_markup=kb)
+    except Exception:
+        try: _tg_call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        except Exception: pass
+        res = tg_send(chat_id, text, reply_markup=kb)
+        new_id = (res or {}).get("result", {}).get("message_id")
+        s = _wl_session_get(chat_id) or {}
+        if new_id: s["msg_id"] = new_id
+        s["grid_season"] = season; s["grid_item"] = watched_id
+        _wl_session_set(chat_id, s)
 
 
 def _render_watchlist(session: dict) -> tuple[str, str]:
